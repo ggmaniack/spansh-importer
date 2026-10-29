@@ -118,9 +118,12 @@ pub struct Survey {
     biggest: Vec<(usize, String)>,
     errors: Vec<String>,
     error_count: u64,
-    system_ids: HashMap<u64, u32>,
+    // Plain list, sorted once at the end: 8 bytes per system instead of a hash map entry.
+    system_ids: Vec<u64>,
     station_ids: HashMap<u64, u32>,
-    body_id64s: HashMap<u64, u32>,
+    // Body ids are not stored: id64 = system | bodyId << 55 (checked below), so unique systems
+    // plus unique bodyIds within each system imply unique body ids. Keeps memory bounded.
+    bodies: u64,
     body_key_dupes: u64,
     body_id64_mismatches: u64,
 }
@@ -153,14 +156,14 @@ impl Survey {
 
     fn check_ids(&mut self, sys: &Value) {
         if let Some(id) = sys["id64"].as_u64() {
-            *self.system_ids.entry(id).or_default() += 1;
+            self.system_ids.push(id);
         }
         let mut body_ids = std::collections::HashSet::new();
         let mut stations: Vec<&Value> = sys["stations"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
         let sys_id = sys["id64"].as_u64();
         for b in sys["bodies"].as_array().into_iter().flatten() {
             if let Some(id) = b["id64"].as_u64() {
-                *self.body_id64s.entry(id).or_default() += 1;
+                self.bodies += 1;
                 // Hypothesis: body id64 = system id64 | bodyId << 55.
                 if sys_id.zip(b["bodyId"].as_u64()).is_some_and(|(s, bid)| id != s | bid << 55) {
                     self.body_id64_mismatches += 1;
@@ -265,15 +268,11 @@ impl Survey {
         self.error_count += o.error_count;
         self.errors.extend(o.errors);
         self.errors.truncate(MAX_ERRORS);
-        for (map, other) in [
-            (&mut self.system_ids, o.system_ids),
-            (&mut self.station_ids, o.station_ids),
-            (&mut self.body_id64s, o.body_id64s),
-        ] {
-            for (id, c) in other {
-                *map.entry(id).or_default() += c;
-            }
+        self.system_ids.extend(o.system_ids);
+        for (id, c) in o.station_ids {
+            *self.station_ids.entry(id).or_default() += c;
         }
+        self.bodies += o.bodies;
         self.body_key_dupes += o.body_key_dupes;
         self.body_id64_mismatches += o.body_id64_mismatches;
     }
@@ -295,17 +294,18 @@ impl Survey {
         for e in &self.errors {
             let _ = writeln!(r, "  {e}");
         }
-        let dupes = |m: &HashMap<u64, u32>| m.values().filter(|&&c| c > 1).count();
+        self.system_ids.sort_unstable();
+        let system_dupes = self.system_ids.windows(2).filter(|w| w[0] == w[1]).count();
+        let station_dupes = self.station_ids.values().filter(|&&c| c > 1).count();
         let _ = writeln!(
             r,
-            "duplicate ids: system id64 {} of {}, station id {} of {}, body id64 {} of {}, (system, bodyId) {}",
-            dupes(&self.system_ids),
+            "duplicate ids: system id64 {} of {}, station id {} of {}, (system, bodyId) {} of {} bodies",
+            system_dupes,
             self.system_ids.len(),
-            dupes(&self.station_ids),
+            station_dupes,
             self.station_ids.len(),
-            dupes(&self.body_id64s),
-            self.body_id64s.len(),
-            self.body_key_dupes
+            self.body_key_dupes,
+            self.bodies
         );
         let _ = writeln!(r, "body id64 != system id64 | bodyId << 55: {}", self.body_id64_mismatches);
         let mut dup_stations: Vec<_> = self.station_ids.iter().filter(|(_, c)| **c > 1).collect();
@@ -451,7 +451,7 @@ mod tests {
         let mut other = Survey::default();
         other.add_line(4, br#"{"id64":2,"name":"C","bodies":[{"id64":7,"bodyId":3}]}"#);
         s.merge(other);
-        assert_eq!(s.system_ids[&2], 2);
+        assert_eq!(s.system_ids.iter().filter(|&&i| i == 2).count(), 2);
         assert_eq!(s.paths["$.name"].values.len(), 3);
         assert_eq!(s.paths["$.bodies"].arr_max, 2);
     }

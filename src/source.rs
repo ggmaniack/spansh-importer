@@ -7,16 +7,8 @@ use flate2::read::MultiGzDecoder;
 /// Opens a dump - local path or http(s) URL - as a buffered decompressed byte stream.
 /// `.gz` is detected by extension; HTTP bodies are streamed, never stored.
 pub fn open(source: &str) -> Result<Box<dyn BufRead + Send>> {
-    // shortcut: a dropped connection fails the run; add Range-based reconnect before full-galaxy runs.
     let raw: Box<dyn Read + Send> = if is_http(source) {
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(None)
-            .build()?
-            .get(source)
-            .send()
-            .and_then(|r| r.error_for_status())
-            .with_context(|| format!("requesting {source}"))?;
-        Box::new(resp)
+        Box::new(HttpReader::open(source)?)
     } else {
         Box::new(File::open(source).with_context(|| format!("opening {source}"))?)
     };
@@ -26,6 +18,79 @@ pub fn open(source: &str) -> Result<Box<dyn BufRead + Send>> {
         raw
     };
     Ok(Box::new(BufReader::with_capacity(1 << 20, raw)))
+}
+
+/// HTTP body reader that survives dropped connections: it re-requests the remaining bytes with
+/// `Range` + `If-Range: <validator>`, so a file replaced on the server comes back as 200 (full
+/// body) and is rejected instead of being spliced onto the old one.
+struct HttpReader {
+    client: reqwest::blocking::Client,
+    url: String,
+    validator: String,
+    offset: u64,
+    resp: reqwest::blocking::Response,
+}
+
+const MAX_CONSECUTIVE_FAILURES: u32 = 20;
+
+impl HttpReader {
+    fn open(url: &str) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(30))
+            // No total timeout (downloads take hours); keepalive turns a dead peer into a read error.
+            .timeout(None)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()?;
+        let resp = client.get(url).send().and_then(|r| r.error_for_status()).with_context(|| format!("requesting {url}"))?;
+        let header = |n| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let validator = header("etag").or_else(|| header("last-modified")).context("server sends neither ETag nor Last-Modified; cannot resume safely")?;
+        Ok(HttpReader { client, url: url.to_owned(), validator, offset: 0, resp })
+    }
+
+    fn reconnect(&mut self) -> std::io::Result<()> {
+        let resp = self
+            .client
+            .get(&self.url)
+            .header("Range", format!("bytes={}-", self.offset))
+            .header("If-Range", &self.validator)
+            .send()
+            .map_err(std::io::Error::other)?;
+        match resp.status().as_u16() {
+            206 => {
+                self.resp = resp;
+                Ok(())
+            }
+            200 => Err(std::io::Error::other(format!("{} changed on the server during the download (If-Range mismatch)", self.url))),
+            s => Err(std::io::Error::other(format!("unexpected HTTP {s} when resuming {}", self.url))),
+        }
+    }
+}
+
+impl Read for HttpReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut failures = 0;
+        loop {
+            match self.resp.read(buf) {
+                Ok(n) => {
+                    self.offset += n as u64;
+                    return Ok(n);
+                }
+                Err(e) if failures < MAX_CONSECUTIVE_FAILURES => {
+                    failures += 1;
+                    let wait = std::time::Duration::from_secs((1u64 << failures.min(6)).min(60));
+                    eprintln!("connection lost at byte {} ({e}); reconnect {failures} in {wait:?}", self.offset);
+                    std::thread::sleep(wait);
+                    if let Err(e) = self.reconnect() {
+                        if e.to_string().contains("changed on the server") {
+                            return Err(e);
+                        }
+                        eprintln!("reconnect failed: {e}");
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 /// Identity of a source file; a resume is only allowed when every field matches the stored run.
