@@ -9,8 +9,6 @@ ALTER TABLE faction_state    ADD PRIMARY KEY (system_id64, faction_name, bucket,
 ALTER TABLE power_conflict   ADD PRIMARY KEY (system_id64, power);
 ALTER TABLE thargoid_war     ADD PRIMARY KEY (system_id64);
 ALTER TABLE body             ADD PRIMARY KEY (id64);
-ALTER TABLE body_parent      ADD PRIMARY KEY (body_id64, ordinal);
-ALTER TABLE body_composition ADD PRIMARY KEY (body_id64, component);
 ALTER TABLE body_signal      ADD PRIMARY KEY (body_id64, signal);
 ALTER TABLE ring             ADD PRIMARY KEY (body_id64, is_belt, ordinal);
 ALTER TABLE ring_signal      ADD PRIMARY KEY (body_id64, is_belt, ordinal, signal);
@@ -23,8 +21,6 @@ ALTER TABLE faction_state    ADD FOREIGN KEY (system_id64, faction_name) REFEREN
 ALTER TABLE power_conflict   ADD FOREIGN KEY (system_id64) REFERENCES system (id64);
 ALTER TABLE thargoid_war     ADD FOREIGN KEY (system_id64) REFERENCES system (id64);
 ALTER TABLE body             ADD FOREIGN KEY (system_id64) REFERENCES system (id64);
-ALTER TABLE body_parent      ADD FOREIGN KEY (body_id64) REFERENCES body (id64);
-ALTER TABLE body_composition ADD FOREIGN KEY (body_id64) REFERENCES body (id64);
 ALTER TABLE body_signal      ADD FOREIGN KEY (body_id64) REFERENCES body (id64);
 ALTER TABLE ring             ADD FOREIGN KEY (body_id64) REFERENCES body (id64);
 ALTER TABLE ring_signal      ADD FOREIGN KEY (body_id64, is_belt, ordinal) REFERENCES ring (body_id64, is_belt, ordinal);
@@ -43,7 +39,8 @@ CREATE INDEX ON system (name);
 CREATE INDEX ON body (system_id64);
 CREATE INDEX ON station (system_id64);
 CREATE INDEX ON market_commodity (commodity_id);
-CREATE INDEX ON station USING gin (module_ids);
+CREATE INDEX ON station USING gin (module_variant_ids);
+CREATE INDEX ON module_variant (module_id);
 CREATE INDEX ON station USING gin (ship_ids);
 
 ANALYZE;

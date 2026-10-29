@@ -17,8 +17,11 @@ CREATE TABLE lookup (
     UNIQUE (kind, name)
 );
 
--- Frontier catalogue entities, keyed by their numeric ids. Attributes are checked for consistency
--- on every occurrence; conflicts are logged to import_issue and kept in the station's extra.
+-- Frontier catalogue entities, keyed by their numeric ids. Commodity and ship attributes are
+-- checked for consistency on every occurrence; conflicts are logged to import_issue and kept in
+-- the station's extra. Modules legitimately vary (stations keep the names/ratings current when
+-- they were last visited, e.g. "Fighter Hangar" vs "Vessel Hangar"), so each distinct attribute
+-- set is a module_variant and stations reference variants.
 CREATE TABLE commodity (
     id       INTEGER PRIMARY KEY,      -- commodityId
     category SMALLINT NOT NULL,        -- lookup 'commodity_category'
@@ -26,14 +29,16 @@ CREATE TABLE commodity (
     name     TEXT NOT NULL
 );
 
-CREATE TABLE module (
-    id       INTEGER PRIMARY KEY,      -- moduleId
-    class    SMALLINT NOT NULL,
-    category SMALLINT NOT NULL,        -- lookup 'module_category'
-    rating   TEXT NOT NULL,
-    symbol   TEXT NOT NULL,
-    name     TEXT NOT NULL,
-    ship     TEXT                      -- ship restriction, by ship name
+CREATE TABLE module_variant (
+    id        INTEGER PRIMARY KEY,     -- assigned by the importer
+    module_id INTEGER NOT NULL,        -- Frontier moduleId
+    class     SMALLINT NOT NULL,
+    category  SMALLINT NOT NULL,       -- lookup 'module_category'
+    rating    TEXT NOT NULL,
+    symbol    TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    ship      TEXT,                    -- ship restriction, by ship name
+    UNIQUE NULLS NOT DISTINCT (module_id, class, category, rating, symbol, name, ship)
 );
 
 CREATE TABLE ship (
@@ -190,23 +195,55 @@ CREATE TABLE body (
     is_landable            BOOLEAN,
     tidally_locked         BOOLEAN,                  -- rotationalPeriodTidallyLocked
     genuses                SMALLINT[],               -- lookup 'genus'; NULL = key absent
+    -- parents[] as parallel arrays, element 1 = immediate parent, then up the chain.
+    parent_kinds           SMALLINT[],               -- lookup 'parent_kind': Null (barycentre) | Star | Planet | Ring
+    parent_body_ids        SMALLINT[],               -- bodyId within the same system
     name                   TEXT NOT NULL,
+    -- solidComposition / atmosphereComposition / materials, percent. One column per component:
+    -- the sets are closed game data (41 components across 16.6M surveyed bodies); a component
+    -- without a column goes to extra. NULL = component absent.
+    solid_ice              DOUBLE PRECISION,
+    solid_rock             DOUBLE PRECISION,
+    solid_metal            DOUBLE PRECISION,
+    atm_ammonia            DOUBLE PRECISION,
+    atm_argon              DOUBLE PRECISION,
+    atm_carbon_dioxide     DOUBLE PRECISION,
+    atm_helium             DOUBLE PRECISION,
+    atm_hydrogen           DOUBLE PRECISION,
+    atm_iron               DOUBLE PRECISION,
+    atm_methane            DOUBLE PRECISION,
+    atm_neon               DOUBLE PRECISION,
+    atm_nitrogen           DOUBLE PRECISION,
+    atm_oxygen             DOUBLE PRECISION,
+    atm_silicates          DOUBLE PRECISION,
+    atm_sulphur_dioxide    DOUBLE PRECISION,
+    atm_water              DOUBLE PRECISION,
+    mat_antimony           DOUBLE PRECISION,
+    mat_arsenic            DOUBLE PRECISION,
+    mat_cadmium            DOUBLE PRECISION,
+    mat_carbon             DOUBLE PRECISION,
+    mat_chromium           DOUBLE PRECISION,
+    mat_germanium          DOUBLE PRECISION,
+    mat_iron               DOUBLE PRECISION,
+    mat_manganese          DOUBLE PRECISION,
+    mat_mercury            DOUBLE PRECISION,
+    mat_molybdenum         DOUBLE PRECISION,
+    mat_nickel             DOUBLE PRECISION,
+    mat_niobium            DOUBLE PRECISION,
+    mat_phosphorus         DOUBLE PRECISION,
+    mat_polonium           DOUBLE PRECISION,
+    mat_ruthenium          DOUBLE PRECISION,
+    mat_selenium           DOUBLE PRECISION,
+    mat_sulphur            DOUBLE PRECISION,
+    mat_technetium         DOUBLE PRECISION,
+    mat_tellurium          DOUBLE PRECISION,
+    mat_tin                DOUBLE PRECISION,
+    mat_tungsten           DOUBLE PRECISION,
+    mat_vanadium           DOUBLE PRECISION,
+    mat_yttrium            DOUBLE PRECISION,
+    mat_zinc               DOUBLE PRECISION,
+    mat_zirconium          DOUBLE PRECISION,
     extra                  JSONB
-);
-
--- parents[]: ordinal 0 is the immediate parent, then up the chain.
-CREATE TABLE body_parent (
-    body_id64      BIGINT NOT NULL,
-    ordinal        SMALLINT NOT NULL,
-    kind           SMALLINT NOT NULL,   -- lookup 'parent_kind': Null (barycentre) | Star | Planet | Ring
-    parent_body_id SMALLINT NOT NULL    -- bodyId within the same system
-);
-
--- atmosphereComposition, solidComposition and materials; the component's lookup kind says which.
-CREATE TABLE body_composition (
-    body_id64 BIGINT NOT NULL,
-    percent   DOUBLE PRECISION NOT NULL,
-    component SMALLINT NOT NULL         -- lookup 'atmosphere_gas' | 'solid' | 'material'
 );
 
 CREATE TABLE body_signal (
@@ -263,7 +300,7 @@ CREATE TABLE station (
     pads_small                SMALLINT,
     services                  SMALLINT[],            -- lookup 'service'; NULL = key absent
     ship_ids                  INTEGER[],             -- shipyard.ships[].shipId -> ship
-    module_ids                INTEGER[],             -- outfitting.modules[].moduleId -> module
+    module_variant_ids        INTEGER[],             -- outfitting.modules[] -> module_variant
     prohibited_commodities    TEXT[],                -- market.prohibitedCommodities
     name                      TEXT NOT NULL,
     real_name                 TEXT,
