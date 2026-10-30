@@ -17,7 +17,7 @@ pub const TABLES: &[(&str, &str)] = &[
     ("faction_state", "system_id64,faction_name,bucket,state,trend"),
     ("power_conflict", "system_id64,power,progress"),
     ("thargoid_war", "system_id64,current_state,success_state,failure_state,progress,days_remaining,ports_remaining,success_reached"),
-    ("body", "id64,system_id64,body_id,name,type,sub_type,updated_at,distance_to_arrival,orbital_period,semi_major_axis,orbital_eccentricity,orbital_inclination,arg_of_periapsis,mean_anomaly,ascending_node,rotational_period,tidally_locked,axial_tilt,surface_temperature,main_star,age,spectral_class,luminosity,absolute_magnitude,solar_masses,solar_radius,is_landable,gravity,earth_masses,radius,surface_pressure,volcanism,atmosphere,terraforming_state,reserve_level,ts_mean_anomaly,ts_distance_to_arrival,signals_updated_at,genuses,parent_kinds,parent_body_ids,\
+    ("body", "id64,system_id64,body_id,name,type,sub_type,updated_at,distance_to_arrival,orbital_period,semi_major_axis,orbital_eccentricity,orbital_inclination,arg_of_periapsis,mean_anomaly,ascending_node,rotational_period,tidally_locked,axial_tilt,surface_temperature,main_star,age,spectral_class,luminosity,absolute_magnitude,solar_masses,solar_radius,is_landable,gravity,earth_masses,radius,surface_pressure,volcanism,atmosphere,terraforming_state,reserve_level,ts_mean_anomaly,ts_distance_to_arrival,ts_ascending_node,signals_updated_at,genuses,parent_kinds,parent_body_ids,\
 solid_ice,solid_rock,solid_metal,\
 atm_ammonia,atm_argon,atm_carbon_dioxide,atm_helium,atm_hydrogen,atm_iron,atm_methane,atm_neon,atm_nitrogen,atm_oxygen,atm_silicates,atm_sulphur_dioxide,atm_water,\
 mat_antimony,mat_arsenic,mat_cadmium,mat_carbon,mat_chromium,mat_germanium,mat_iron,mat_manganese,mat_mercury,mat_molybdenum,mat_nickel,mat_niobium,mat_phosphorus,\
@@ -409,7 +409,7 @@ impl Fields {
     }
 
     /// Items of array `k` that pass `checks` become `Fields`; the rest are kept whole as misfits.
-    fn items(&mut self, k: &str, checks: &[(&str, fn(&Value) -> bool)]) -> Option<Vec<Fields>> {
+    fn items(&mut self, k: &str, checks: &[Check]) -> Option<Vec<Fields>> {
         let items = self.arr(k)?;
         let mut out = Vec::with_capacity(items.len());
         for (i, it) in items.into_iter().enumerate() {
@@ -474,10 +474,13 @@ impl Fields {
     }
 }
 
-fn has_map(m: &Map<String, Value>, checks: &[(&str, fn(&Value) -> bool)]) -> bool {
+/// (key, predicate its value must satisfy)
+type Check = (&'static str, fn(&Value) -> bool);
+
+fn has_map(m: &Map<String, Value>, checks: &[Check]) -> bool {
     checks.iter().all(|(k, ok)| m.get(*k).is_some_and(ok))
 }
-fn has(v: &Value, checks: &[(&str, fn(&Value) -> bool)]) -> bool {
+fn has(v: &Value, checks: &[Check]) -> bool {
     v.as_object().is_some_and(|m| has_map(m, checks))
 }
 fn is_u64(v: &Value) -> bool {
@@ -756,15 +759,16 @@ impl Projector {
             }
             sg.finish(&mut extra, &mut self.issues);
         }
-        let (mut ts_mean_anomaly, mut ts_distance) = (None, None);
+        let (mut ts_mean_anomaly, mut ts_distance, mut ts_ascending_node) = (None, None, None);
         if let Some(mut ts) = f.obj("timestamps") {
             ts_mean_anomaly = ts.ts("meanAnomaly");
             ts_distance = ts.ts("distanceToArrival");
+            ts_ascending_node = ts.ts("ascendingNode");
             ts.finish(&mut extra, &mut self.issues);
         }
         let body_id: Option<i16> = f.int("bodyId");
         let name = f.string("name");
-        let row = b.t(T::Body).row(42 + COMPOSITION_COLUMNS as i16);
+        let row = b.t(T::Body).row(43 + COMPOSITION_COLUMNS as i16);
         row.i64(Some(id))
             .i64(Some(sys))
             .i16(body_id)
@@ -806,6 +810,7 @@ impl Projector {
             .i16(f.lookup("reserveLevel", "reserve_level", d)?)
             .ts(ts_mean_anomaly)
             .ts(ts_distance)
+            .ts(ts_ascending_node)
             .ts(signals_at)
             .i16_array(genuses.as_deref())
             .i16_array(parents.as_ref().map(|p| &p.0[..]))
@@ -888,7 +893,7 @@ impl Projector {
                 }
                 prohibited = Some(names);
             }
-            let checks: &[(&str, fn(&Value) -> bool)] = &[
+            let checks: &[Check] = &[
                 ("commodityId", is_i32),
                 ("symbol", is_str),
                 ("name", is_str),
@@ -945,7 +950,7 @@ impl Projector {
         let (mut outfitting_at, mut variant_ids) = (None, None);
         if let Some(mut of) = f.obj("outfitting") {
             outfitting_at = of.ts("updateTime");
-            let checks: &[(&str, fn(&Value) -> bool)] =
+            let checks: &[Check] =
                 &[("moduleId", is_i32), ("class", is_i16), ("category", is_str), ("rating", is_str), ("symbol", is_str), ("name", is_str)];
             if let Some(items) = of.items("modules", checks) {
                 let mut ids = Vec::with_capacity(items.len());
@@ -1026,7 +1031,7 @@ mod tests {
         let body: Vec<&str> = TABLES.iter().find(|t| t.0 == "body").unwrap().1.split(',').collect();
         let at = body.iter().position(|c| *c == "solid_ice").unwrap();
         assert_eq!(body[at..at + COMPOSITION_COLUMNS], expected[..]);
-        assert_eq!(body.len(), 42 + COMPOSITION_COLUMNS);
+        assert_eq!(body.len(), 43 + COMPOSITION_COLUMNS);
     }
 
     #[test]

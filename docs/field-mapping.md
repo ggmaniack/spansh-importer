@@ -54,7 +54,7 @@ the load). All tables live in schema `spansh`. Paths below are relative to one s
 | `mainStar`, `age`, `spectralClass`, `luminosity`, `absoluteMagnitude`, `solarMasses`, `solarRadius` | snake_case | stars; `spectral_class`, `luminosity` are lookups (many values outside the schema enums) |
 | `isLandable`, `gravity`, `earthMasses`, `radius`, `surfacePressure` | snake_case | planets |
 | `volcanismType`, `atmosphereType`, `terraformingState`, `reserveLevel` | `volcanism`, `atmosphere`, `terraforming_state`, `reserve_level` | lookups |
-| `timestamps.{meanAnomaly,distanceToArrival}` | `ts_mean_anomaly`, `ts_distance_to_arrival` | other keys -> `extra` |
+| `timestamps.{meanAnomaly,distanceToArrival,ascendingNode}` | `ts_mean_anomaly`, `ts_distance_to_arrival`, `ts_ascending_node` | other keys -> `extra`; `ascendingNode` first appeared in the full galaxy dump |
 | `parents[]` (`{kind: bodyId}`) | `parent_kinds SMALLINT[]`, `parent_body_ids SMALLINT[]` | parallel arrays, element 1 = immediate parent; kind lookup `parent_kind` |
 | `atmosphereComposition{}` | `atm_<gas>` columns (13) | percent; a component without a column goes to `extra` |
 | `solidComposition{}` | `solid_ice`, `solid_rock`, `solid_metal` | percent |

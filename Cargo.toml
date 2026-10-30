@@ -2,6 +2,9 @@
 name = "spansh-importer"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Streams the Spansh Elite Dangerous galaxy dump into normalized PostgreSQL"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.104"

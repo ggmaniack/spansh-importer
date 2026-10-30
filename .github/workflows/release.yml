@@ -1,0 +1,50 @@
+name: Release
+
+# Push a tag like v0.1.0 to build binaries and publish a GitHub release with them.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: spansh-importer }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, exe: spansh-importer.exe }
+          - { os: macos-latest, target: aarch64-apple-darwin, exe: spansh-importer }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Package
+        shell: bash
+        run: |
+          name=spansh-importer-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$name"
+          cp "target/release/${{ matrix.exe }}" README.md "$name/"
+          cp -r db "$name/"
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: spansh-importer-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" spansh-importer-* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

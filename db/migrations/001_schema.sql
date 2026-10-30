@@ -180,6 +180,7 @@ CREATE TABLE body (
     updated_at             TIMESTAMPTZ NOT NULL,     -- updateTime
     ts_mean_anomaly        TIMESTAMPTZ,              -- timestamps.meanAnomaly
     ts_distance_to_arrival TIMESTAMPTZ,
+    ts_ascending_node      TIMESTAMPTZ,              -- first seen in the full galaxy dump (2026-10-30)
     signals_updated_at     TIMESTAMPTZ,              -- signals.updateTime
     age                    INTEGER,
     body_id                SMALLINT NOT NULL,

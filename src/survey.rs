@@ -146,7 +146,7 @@ impl Survey {
         let name = v["name"].as_str().unwrap_or("?");
         self.biggest.push((bytes.len(), name.to_owned()));
         if self.biggest.len() > 40 {
-            self.biggest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            self.biggest.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
             self.biggest.truncate(10);
         }
         self.check_ids(&v);
@@ -313,7 +313,7 @@ impl Survey {
         for (id, c) in dup_stations.iter().take(10) {
             let _ = writeln!(r, "  station id {id} appears {c}x");
         }
-        self.biggest.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        self.biggest.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
         let _ = writeln!(r, "largest systems:");
         for (n, name) in self.biggest.iter().take(10) {
             let _ = writeln!(r, "  {n:>10} bytes  {name}");
