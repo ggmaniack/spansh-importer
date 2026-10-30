@@ -1,23 +1,54 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
 
+use crate::report::Level;
+
+/// An opened dump: the decompressed stream, plus how many bytes of the source file (compressed, if
+/// `.gz`) have been read so far out of `size`.
+pub struct Input {
+    pub reader: Box<dyn BufRead + Send>,
+    pub read: Arc<AtomicU64>,
+    pub size: Option<u64>,
+}
+
+struct Counting<R> {
+    inner: R,
+    read: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 /// Opens a dump - local path or http(s) URL - as a buffered decompressed byte stream.
 /// `.gz` is detected by extension; HTTP bodies are streamed, never stored.
-pub fn open(source: &str) -> Result<Box<dyn BufRead + Send>> {
-    let raw: Box<dyn Read + Send> = if is_http(source) {
-        Box::new(HttpReader::open(source)?)
+pub fn open(source: &str) -> Result<Input> {
+    let (raw, size): (Box<dyn Read + Send>, Option<u64>) = if is_http(source) {
+        let r = HttpReader::open(source)?;
+        let size = r.resp.content_length();
+        (Box::new(r), size)
     } else {
-        Box::new(File::open(source).with_context(|| format!("opening {source}"))?)
+        let f = File::open(source).with_context(|| format!("opening {source}"))?;
+        let size = f.metadata().ok().map(|m| m.len());
+        (Box::new(f), size)
     };
+    let read = Arc::new(AtomicU64::new(0));
+    let raw: Box<dyn Read + Send> = Box::new(Counting { inner: raw, read: read.clone() });
     let raw: Box<dyn Read + Send> = if source.ends_with(".gz") {
         Box::new(MultiGzDecoder::new(BufReader::with_capacity(1 << 20, raw)))
     } else {
         raw
     };
-    Ok(Box::new(BufReader::with_capacity(1 << 20, raw)))
+    Ok(Input { reader: Box::new(BufReader::with_capacity(1 << 20, raw)), read, size })
 }
 
 /// HTTP body reader that survives dropped connections: it re-requests the remaining bytes with
@@ -78,13 +109,13 @@ impl Read for HttpReader {
                 Err(e) if failures < MAX_CONSECUTIVE_FAILURES => {
                     failures += 1;
                     let wait = std::time::Duration::from_secs((1u64 << failures.min(6)).min(60));
-                    eprintln!("connection lost at byte {} ({e}); reconnect {failures} in {wait:?}", self.offset);
+                    crate::report::log(Level::Warn, "reconnect", &format!("connection lost at byte {} ({e}); reconnect {failures} in {wait:?}", self.offset));
                     std::thread::sleep(wait);
                     if let Err(e) = self.reconnect() {
                         if e.to_string().contains("changed on the server") {
                             return Err(e);
                         }
-                        eprintln!("reconnect failed: {e}");
+                        crate::report::log(Level::Warn, "reconnect_failed", &format!("reconnect failed: {e}"));
                     }
                 }
                 Err(e) => return Err(e),

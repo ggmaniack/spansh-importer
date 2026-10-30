@@ -57,6 +57,39 @@ Prebuilt binaries for Linux, Windows and macOS are attached to each
 Any Spansh dump with the one-system-per-line layout works: `galaxy.json.gz`, `galaxy_1day`,
 `galaxy_7days`, `galaxy_1month`, `galaxy_populated`, `galaxy_stations`.
 
+## Progress and logs
+
+All commands show the same status block in the terminal, redrawn twice a second:
+
+```
+ingest  [#######.............]  38.7%  45.8 GB / 118.5 GB  1h12m elapsed, ETA 1h54m
+batch 2478, 66067109 systems (+0 skipped), 239595 MB JSON (55 MB/s), 166315 MB COPY, 0 issues
+warnings 0  errors 0  log logs\ingest-20261030-080506.log
+```
+
+- **Progress:** for `ingest` and `survey`, the bar counts bytes of the source file read (compressed
+  bytes for `.gz`). For `finalize`, it counts SQL steps, plus the current index build's own
+  progress from `pg_stat_progress_create_index`.
+- **Redirected stderr:** when stderr is not a terminal, the status is printed as a single line once
+  a minute instead.
+
+Every run also writes its own log file, `<log-dir>/<command>-<YYYYMMDD-HHMMSS>.log`. The
+timestamp is UTC, and `--log-dir` defaults to `logs`. Every line has the same four fields in
+[logfmt](https://brandur.org/logfmt):
+
+```
+ts=2026-10-30T08:06:06.512Z level=INFO event=progress msg="[#.......] 5.2%  6.1 GB / 118.5 GB ... | batch 120, ..."
+ts=2026-10-30T09:20:41.007Z level=WARN event=reconnect msg="connection lost at byte 102177800192 (...); reconnect 1 in 2s"
+```
+
+- **Levels:** `INFO`, `WARN` and `ERROR`.
+- **Events:** `start`, `progress` (once a minute), `step` (each `finalize` statement and its
+  duration), `issue` (a data problem also stored in `import_issue`), `reconnect`, `error`,
+  `summary`, and `done` / `failed`.
+- **Rate limit:** each warning or error event is written at most 20 times per run. After that,
+  repeats are only counted, and a `suppressed` line with the count follows each progress line. This
+  keeps the log a few hundred lines long even for a 3-hour import.
+
 ## Resume and source identity
 
 Every run records a fingerprint of its source in `import_run`:

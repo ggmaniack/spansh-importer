@@ -2,6 +2,8 @@
 //! Each batch commits together with its `import_batch` row, which is the resume checkpoint.
 
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -9,6 +11,7 @@ use postgres::{Client, NoTls};
 
 use crate::pgcopy::{HEADER, TRAILER};
 use crate::project::{Batch, Dict, Issues, Projector, TABLES};
+use crate::report::{self, Level, Unit};
 use crate::source::{self, Fingerprint};
 
 pub struct Options {
@@ -50,13 +53,53 @@ pub fn init(database: &str) -> Result<()> {
     Ok(())
 }
 
-/// Adds primary keys, foreign keys and indexes after the load, in one transaction.
+/// Adds primary keys, foreign keys and indexes after the load, in one transaction. Statements run
+/// one at a time so each can be reported; a second connection reports index build progress.
 pub fn finalize(database: &str) -> Result<()> {
-    let mut c = connect(database)?;
-    let mut tx = c.transaction()?;
-    tx.batch_execute(include_str!("../db/migrations/002_constraints.sql"))?;
-    tx.commit()?;
-    Ok(())
+    let steps = statements(include_str!("../db/migrations/002_constraints.sql"));
+    let done = Arc::new(AtomicU64::new(0));
+    report::track(done.clone(), Some(steps.len() as u64), Unit::Steps);
+    let mut watcher = connect(database)?;
+    let finished = Arc::new(AtomicBool::new(false));
+    let stop = finished.clone();
+    let poller = std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            let row = watcher.query_opt(
+                "SELECT relid::regclass::text, phase, round(100.0 * blocks_done / nullif(blocks_total, 0), 1)::float8
+                 FROM pg_stat_progress_create_index LIMIT 1",
+                &[],
+            );
+            report::note(match row {
+                Ok(Some(r)) => format!("{}: {} {}%", r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, Option<f64>>(2).unwrap_or(0.0)),
+                _ => String::new(),
+            });
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    let result = (|| -> Result<()> {
+        let mut c = connect(database)?;
+        let mut tx = c.transaction()?;
+        for (i, sql) in steps.iter().enumerate() {
+            let label = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            report::detail(format!("step {}/{}: {label}", i + 1, steps.len()));
+            let t = Instant::now();
+            tx.batch_execute(sql).with_context(|| format!("finalize step {}: {label}", i + 1))?;
+            report::log(Level::Info, "step", &format!("{label} ({})", report::hms(t.elapsed())));
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+        report::detail("committing");
+        tx.commit()?;
+        Ok(())
+    })();
+    finished.store(true, Ordering::Relaxed);
+    let _ = poller.join();
+    result
+}
+
+/// Splits a migration into statements (no function bodies or quoted `;` in these files).
+fn statements(sql: &str) -> Vec<String> {
+    let stripped: String = sql.lines().map(|l| l.split("--").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+    stripped.split(';').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
 }
 
 /// Finds the run to continue, or starts a new one. Refuses to mix two versions of a source.
@@ -141,7 +184,9 @@ pub fn run(o: &Options) -> Result<Summary> {
 fn ingest(o: &Options, db: &mut Client, p: &mut Projector, run_id: i32, committed: &[(u64, u64)], start: Instant) -> Result<Summary> {
     let limit = o.batch_mib << 20;
     let mut s = Summary { run_id, rows: vec![0; TABLES.len()], ..Default::default() };
-    let mut input = source::open(&o.source)?;
+    let input = source::open(&o.source)?;
+    report::track(input.read.clone(), input.size, Unit::Bytes);
+    let mut input = input.reader;
     let mut batch = Batch::new();
     let mut line = Vec::with_capacity(1 << 20);
     let mut ordinal = 0u64;
@@ -199,15 +244,16 @@ fn ingest(o: &Options, db: &mut Client, p: &mut Projector, run_id: i32, committe
         if batch.bytes() >= limit {
             flush(db, run_id, &mut batch, &mut s)?;
             let el = start.elapsed().as_secs_f64();
-            eprintln!(
-                "batch {:>5}: ordinal {:>10}, {:>9} systems, {:>7.0} MB JSON ({:.0} MB/s), {:.0} MB COPY",
+            report::detail(format!(
+                "batch {}, {} systems (+{} skipped), {:.0} MB JSON ({:.0} MB/s), {:.0} MB COPY, {} issues",
                 s.batches,
-                ordinal,
                 s.systems,
+                s.skipped,
                 s.json_bytes as f64 / 1e6,
                 s.json_bytes as f64 / 1e6 / el,
-                s.copy_bytes as f64 / 1e6
-            );
+                s.copy_bytes as f64 / 1e6,
+                p.issues.total
+            ));
         }
     }
     flush(db, run_id, &mut batch, &mut s)?;
@@ -233,35 +279,38 @@ fn flush(db: &mut Client, run_id: i32, batch: &mut Batch, s: &mut Summary) -> Re
 }
 
 impl Summary {
+    /// Prints the summary to stderr and the log.
     pub fn print(&self) {
         let secs = self.elapsed.as_secs_f64();
         let rows: u64 = self.rows.iter().sum();
-        eprintln!("run {} {}", self.run_id, if self.complete { "complete" } else { "stopped early (resumable)" });
-        eprintln!(
-            "systems {} (+{} skipped as already committed, {} invalid), {} batches, {} issues",
-            self.systems, self.skipped, self.invalid, self.batches, self.issues
-        );
-        eprintln!(
-            "{:.1}s total: {:.0} MB JSON ({:.0} MB/s), {:.0} systems/s, {} rows ({:.0} rows/s), {:.0} MB COPY",
-            secs,
-            self.json_bytes as f64 / 1e6,
-            self.json_bytes as f64 / 1e6 / secs,
-            self.systems as f64 / secs,
-            rows,
-            rows as f64 / secs,
-            self.copy_bytes as f64 / 1e6
-        );
-        eprintln!(
-            "time in: read+gunzip {:.1}s, parse {:.1}s, project {:.1}s, COPY+commit {:.1}s",
-            self.t_read.as_secs_f64(),
-            self.t_parse.as_secs_f64(),
-            self.t_project.as_secs_f64(),
-            self.t_copy.as_secs_f64()
-        );
-        for ((name, _), n) in TABLES.iter().zip(&self.rows) {
-            if *n > 0 {
-                eprintln!("  {name:<18} {n:>12}");
-            }
+        let mut lines = vec![
+            format!("run {} {}", self.run_id, if self.complete { "complete" } else { "stopped early (resumable)" }),
+            format!(
+                "systems {} (+{} skipped as already committed, {} invalid), {} batches, {} issues",
+                self.systems, self.skipped, self.invalid, self.batches, self.issues
+            ),
+            format!(
+                "{:.1}s total: {:.0} MB JSON ({:.0} MB/s), {:.0} systems/s, {} rows ({:.0} rows/s), {:.0} MB COPY",
+                secs,
+                self.json_bytes as f64 / 1e6,
+                self.json_bytes as f64 / 1e6 / secs,
+                self.systems as f64 / secs,
+                rows,
+                rows as f64 / secs,
+                self.copy_bytes as f64 / 1e6
+            ),
+            format!(
+                "time in: read+gunzip {:.1}s, parse {:.1}s, project {:.1}s, COPY+commit {:.1}s",
+                self.t_read.as_secs_f64(),
+                self.t_parse.as_secs_f64(),
+                self.t_project.as_secs_f64(),
+                self.t_copy.as_secs_f64()
+            ),
+        ];
+        lines.extend(TABLES.iter().zip(&self.rows).filter(|(_, n)| **n > 0).map(|((name, _), n)| format!("  {name:<18} {n:>12}")));
+        for l in &lines {
+            report::log(Level::Info, "summary", l.trim());
+            eprintln!("{l}");
         }
     }
 }

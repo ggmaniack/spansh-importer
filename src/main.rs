@@ -1,6 +1,7 @@
 mod ingest;
 mod pgcopy;
 mod project;
+mod report;
 mod source;
 mod survey;
 
@@ -9,6 +10,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use crate::report::Level;
+
 const DEFAULT_DB: &str = "postgres://postgres@localhost:5432/elite";
 
 #[derive(Parser)]
@@ -16,6 +19,9 @@ const DEFAULT_DB: &str = "postgres://postgres@localhost:5432/elite";
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Directory for log files (<command>-<UTC timestamp>.log).
+    #[arg(long, global = true, default_value = "logs")]
+    log_dir: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -60,19 +66,51 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    let (command, about) = match &cli.cmd {
+        Cmd::Survey { source, workers, .. } => ("survey", format!("survey {source} with {workers} workers")),
+        Cmd::Init { .. } => ("init", "recreate schema spansh".to_owned()),
+        Cmd::Ingest { source, batch_mib, .. } => ("ingest", format!("ingest {source}, batches of {batch_mib} MiB")),
+        Cmd::Finalize { .. } => ("finalize", "add keys and indexes".to_owned()),
+    };
+    report::start(command, &cli.log_dir, &about)?;
+    match run(cli.cmd) {
+        Ok(after) => {
+            report::finish(true);
+            after();
+            Ok(())
+        }
+        Err(e) => {
+            // Shown in the terminal and the log by report::log.
+            report::log(Level::Error, "error", &format!("{e:#}"));
+            report::finish(false);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Runs the command; the returned closure prints its results once the status display is closed.
+fn run(cmd: Cmd) -> Result<Box<dyn FnOnce()>> {
+    Ok(match cmd {
         Cmd::Survey { source, out, workers } => {
             let report = survey::run(source::open(&source)?, workers, &source)?;
             std::fs::write(&out, &report)?;
-            eprintln!("{}", report.lines().take(20).collect::<Vec<_>>().join("\n"));
-            eprintln!("report written to {}", out.display());
+            Box::new(move || {
+                eprintln!("{}", report.lines().take(20).collect::<Vec<_>>().join("\n"));
+                eprintln!("report written to {}", out.display());
+            })
         }
-        Cmd::Init { database } => ingest::init(&database)?,
+        Cmd::Init { database } => {
+            ingest::init(&database)?;
+            Box::new(|| ())
+        }
         Cmd::Ingest { source, database, batch_mib, max_systems, issue_cap } => {
             let s = ingest::run(&ingest::Options { source, database, batch_mib, max_systems, issue_cap })?;
-            s.print();
+            Box::new(move || s.print())
         }
-        Cmd::Finalize { database } => ingest::finalize(&database)?,
-    }
-    Ok(())
+        Cmd::Finalize { database } => {
+            ingest::finalize(&database)?;
+            Box::new(|| ())
+        }
+    })
 }

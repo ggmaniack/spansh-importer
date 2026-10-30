@@ -379,7 +379,8 @@ impl Survey {
 }
 
 /// Reads the dump line by line and fans lines out to `workers` threads, each with its own `Survey`.
-pub fn run(input: Box<dyn BufRead + Send>, workers: usize, source: &str) -> Result<String> {
+pub fn run(input: crate::source::Input, workers: usize, source: &str) -> Result<String> {
+    crate::report::track(input.read.clone(), input.size, crate::report::Unit::Bytes);
     let start = Instant::now();
     let (tx, rx) = crossbeam_channel::bounded::<(u64, Vec<u8>)>(workers * 64);
     let handles: Vec<_> = (0..workers)
@@ -398,7 +399,7 @@ pub fn run(input: Box<dyn BufRead + Send>, workers: usize, source: &str) -> Resu
         .collect();
     drop(rx);
 
-    let mut input = input;
+    let mut input = input.reader;
     let mut line_no = 0u64;
     let mut total = 0u64;
     let mut last_report = Instant::now();
@@ -409,10 +410,10 @@ pub fn run(input: Box<dyn BufRead + Send>, workers: usize, source: &str) -> Resu
         }
         line_no += 1;
         total += buf.len() as u64;
-        if last_report.elapsed().as_secs() >= 10 {
+        if last_report.elapsed().as_secs() >= 1 {
             last_report = Instant::now();
             let s = start.elapsed().as_secs_f64();
-            eprintln!("{line_no} lines, {:.0} MB, {:.0} MB/s", total as f64 / 1e6, total as f64 / 1e6 / s);
+            crate::report::detail(format!("{line_no} lines, {:.0} MB JSON ({:.0} MB/s)", total as f64 / 1e6, total as f64 / 1e6 / s));
         }
         tx.send((line_no, buf))?;
     }

@@ -271,6 +271,7 @@ impl Issues {
 
     pub fn add(&mut self, path: String, kind: &'static str, detail: String) {
         self.total += 1;
+        crate::report::log(crate::report::Level::Warn, "issue", &format!("{kind} at {path}: {}", truncate(detail.clone(), 300)));
         if self.logged < self.cap {
             self.logged += 1;
             self.pending.push((path, kind, truncate(detail, 2000)));
