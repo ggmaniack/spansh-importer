@@ -47,17 +47,46 @@ The program is then at `target/release/spansh-importer`.
 
 **1. Create a database** (once):
 
-```sh
-createdb elite
+```sql
+CREATE DATABASE elite;
 ```
 
-**2. Tell the importer where it is.** The default is `postgres://postgres@localhost:5432/elite`. If
-yours differs, set `DATABASE_URL` or pass `--database` to each command:
+Run this in `psql`, pgAdmin or any SQL tool. From a terminal, PostgreSQL's `createdb` tool does
+the same: `createdb -U postgres elite`. It's in PostgreSQL's `bin` folder if it's not on your PATH.
 
-```sh
-export DATABASE_URL=postgres://user:password@host:5432/elite     # Linux / macOS
-$env:DATABASE_URL = "postgres://user:password@host:5432/elite"   # Windows PowerShell
-```
+**2. Tell the importer where it is.** With no settings, it connects to database `elite` on
+`localhost:5432` as user `postgres`. Otherwise use any of the usual PostgreSQL ways:
+
+- a connection string in `DATABASE_URL`, or `--database` on each command:
+
+  ```sh
+  export DATABASE_URL="postgres://user:password@host:5432/elite"     # Linux / macOS
+  $env:DATABASE_URL = "postgres://user:password@host:5432/elite"     # Windows PowerShell
+  ```
+
+  The `key=value` form also works: `"host=db.example user=me dbname=elite sslmode=require"`.
+- the standard variables `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE` and
+  `PGSSLROOTCERT`. They fill in whatever the connection string leaves out.
+- a password file: `~/.pgpass` on Linux and macOS, `%APPDATA%\postgresql\pgpass.conf` on Windows,
+  or the file named in `PGPASSFILE`. This keeps the password out of commands and shell history.
+
+**Encryption** works as in other PostgreSQL tools:
+
+| `sslmode` | Meaning |
+|---|---|
+| `prefer` (default) | Encrypt if the server supports it. |
+| `require` | Always encrypt. The server's certificate isn't checked, unless you also give `sslrootcert`. |
+| `verify-ca` | Encrypt, and check the certificate against `sslrootcert`, or the system's trusted certificates. |
+| `verify-full` | Also check that the certificate matches the host name. Use this for cloud databases. |
+| `disable` | Never encrypt. |
+
+Add it to the URL as `?sslmode=verify-full&sslrootcert=/path/ca.pem`. Cloud providers publish their
+CA certificate for `sslrootcert`.
+
+Special characters in a password must be percent-encoded in the URL form, for example `@` as `%40`.
+In the `key=value` form, a backslash escapes the next character, as in other PostgreSQL tools.
+Write Windows paths there with forward slashes (`sslrootcert='C:/certs/ca.pem'`) or doubled
+backslashes.
 
 **3. Run the three steps:**
 
@@ -70,7 +99,8 @@ spansh-importer finalize
 - **`init`** creates the empty tables. It deletes any previous import in that database.
 - **`ingest`** streams the dump into the tables. This is the long step.
 - **`finalize`** checks the data for duplicates and broken references, then builds the indexes that
-  make queries fast. For the full galaxy this takes from several minutes to about an hour.
+  make queries fast, a 3D index for "what's near here?" searches, and the `system_flags` table of
+  route-planning flags. For the full galaxy this takes about 40 minutes to an hour.
 
 To import a file you've already downloaded, give its path instead of the URL:
 `--source D:\dumps\galaxy.json.gz`.
@@ -107,13 +137,20 @@ from the exact byte, as long as Spansh hasn't replaced the file in the meantime.
 
 ## Updating to a newer dump
 
-Imports aren't incremental. To move to a newer dump, run `init` and the three steps again. Keep the
-old database for queries meanwhile by importing into a second database, then switch.
+Imports aren't incremental. To move to a newer dump, run the three steps again. To keep using the
+old data meanwhile, import into a second schema (`--schema spansh_new` on all three commands), then
+swap the schemas when it's done:
+
+``sql
+ALTER SCHEMA spansh RENAME TO spansh_old;
+ALTER SCHEMA spansh_new RENAME TO spansh;
+DROP SCHEMA spansh_old CASCADE;
+``
 
 ## Using the data
 
-Everything is in the `spansh` schema. Run `SET search_path = spansh;` first, or prefix the table
-names.
+Everything is in the `spansh` schema, or the one you chose with `--schema`. Run
+`SET search_path = spansh, public;` first, or prefix the table names.
 
 Find a system:
 
@@ -145,6 +182,25 @@ WHERE s.name = 'Sol' AND b.is_landable
 ORDER BY b.gravity;
 ```
 
+The 10 systems nearest to Sol. This uses the 3D index, so write the distance exactly in this form:
+
+```sql
+SELECT name, cube(array[x, y, z]) <-> cube(array[0, 0, 0]) AS ly
+FROM system
+ORDER BY cube(array[x, y, z]) <-> cube(array[0, 0, 0])
+LIMIT 10;
+```
+
+The nearest system with a fuel-scoopable arrival star, from a given position:
+
+```sql
+SELECT s.name, cube(array[s.x, s.y, s.z]) <-> cube(array[-78.6, -149.6, -340.5]) AS ly
+FROM system s JOIN system_flags f ON f.id64 = s.id64
+WHERE f.main_star_scoopable
+ORDER BY cube(array[s.x, s.y, s.z]) <-> cube(array[-78.6, -149.6, -340.5])
+LIMIT 1;
+```
+
 Stations that sell a ship:
 
 ```sql
@@ -169,6 +225,7 @@ What's in each table:
 | `station_economy` | 1.3M | station economies |
 | `system_faction`, `faction_state` | 661k, 250k | minor factions and their states |
 | `commodity`, `ship`, `module_variant` | | names of commodities, ships and outfitting modules |
+| `system_flags` | | route planning per system: arrival star type, fuel-scoopable arrival star, scoopable star within 100 ls, neutron star nearby |
 | `lookup` | | text for the numeric name columns |
 
 [docs/field-mapping.md](docs/field-mapping.md) lists where every field from the dump ends up.
@@ -186,8 +243,11 @@ Options:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--database` | `$DATABASE_URL`, else `postgres://postgres@localhost:5432/elite` | Database to use |
+| `--database` | `$DATABASE_URL`, then `PG*` variables, then `postgres@localhost:5432/elite` | Database to use (see step 2 above) |
+| `--schema` | `, else `spansh` | Database schema for the tables. Use a second schema to build a fresh import next to the one in use. |
 | `--log-dir` | `logs` | Where log files go |
+| `--no-spatial` | | `finalize`: skip the 3D index on system coordinates |
+| `--no-flags` | | `finalize`: skip the `system_flags` table |
 | `--batch-mib` | `64` | `ingest`: how much data to save at a time. An interruption loses at most one batch. |
 | `--max-systems` | | `ingest`: stop after this many systems, e.g. for a quick trial. Resumable. |
 | `--issue-cap` | `100000` | `ingest`: how many data problems to store in `import_issue`; all are counted. |

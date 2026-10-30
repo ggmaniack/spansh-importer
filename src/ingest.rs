@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use postgres::{Client, NoTls};
+use postgres::Client;
 
+use crate::db::connect;
 use crate::pgcopy::{HEADER, TRAILER};
 use crate::project::{Batch, Dict, Issues, Projector, TABLES};
 use crate::report::{self, Level, Unit};
@@ -17,6 +18,7 @@ use crate::source::{self, Fingerprint};
 pub struct Options {
     pub source: String,
     pub database: String,
+    pub schema: String,
     pub batch_mib: usize,
     pub max_systems: Option<u64>,
     pub issue_cap: u64,
@@ -41,14 +43,10 @@ pub struct Summary {
     pub elapsed: Duration,
 }
 
-pub fn connect(url: &str) -> Result<Client> {
-    Client::connect(url, NoTls).with_context(|| format!("connecting to {url}"))
-}
-
-/// Drops and recreates the `spansh` schema (load phase: no keys on the big tables).
-pub fn init(database: &str) -> Result<()> {
-    let mut c = connect(database)?;
-    c.batch_execute("DROP SCHEMA IF EXISTS spansh CASCADE")?;
+/// Drops and recreates the import schema (load phase: no keys on the big tables).
+pub fn init(database: &str, schema: &str) -> Result<()> {
+    let mut c = connect(database, schema)?;
+    c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"))?;
     c.batch_execute(include_str!("../db/migrations/001_schema.sql"))?;
     Ok(())
 }
@@ -56,11 +54,17 @@ pub fn init(database: &str) -> Result<()> {
 /// Adds primary keys, foreign keys and indexes after the load. Each statement commits on its own
 /// and finished ones are skipped, so an interrupted run resumes; a second connection reports index
 /// build progress.
-pub fn finalize(database: &str) -> Result<()> {
-    let steps = statements(include_str!("../db/migrations/002_constraints.sql"));
+pub fn finalize(database: &str, schema: &str, spatial: bool, flags: bool) -> Result<()> {
+    let mut steps = statements(include_str!("../db/migrations/002_constraints.sql"));
+    if spatial {
+        steps.extend(statements(include_str!("../db/migrations/003_spatial.sql")));
+    }
+    if flags {
+        steps.extend(statements(include_str!("../db/migrations/004_flags.sql")));
+    }
     let done = Arc::new(AtomicU64::new(0));
     report::track(done.clone(), Some(steps.len() as u64), Unit::Steps);
-    let mut watcher = connect(database)?;
+    let mut watcher = connect(database, schema)?;
     let finished = Arc::new(AtomicBool::new(false));
     let stop = finished.clone();
     let poller = std::thread::spawn(move || {
@@ -78,11 +82,13 @@ pub fn finalize(database: &str) -> Result<()> {
         }
     });
     let result = (|| -> Result<()> {
-        let mut c = connect(database)?;
+        let mut c = connect(database, schema)?;
         let mut skipped = 0;
         for (i, sql) in steps.iter().enumerate() {
             let label = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-            report::detail(format!("step {}/{}: {label}", i + 1, steps.len()));
+            // Short enough that the index build progress (the note) still fits on the line.
+            let short: String = label.chars().take(50).collect();
+            report::detail(format!("step {}/{}: {short}{}", i + 1, steps.len(), if short.len() < label.len() { "…" } else { "" }));
             if step_done(&mut c, sql)? {
                 skipped += 1;
             } else {
@@ -112,7 +118,7 @@ fn step_done(c: &mut Client, sql: &str) -> Result<bool> {
         (None, Some(n)) => (n, false),
         (None, None) => return Ok(false),
     };
-    let row = c.query_opt("SELECT convalidated FROM pg_constraint WHERE conname = $1 AND connamespace = 'spansh'::regnamespace", &[&name])?;
+    let row = c.query_opt("SELECT convalidated FROM pg_constraint WHERE conname = $1 AND connamespace = current_schema()::regnamespace", &[&name])?;
     Ok(row.is_some_and(|r| !need_valid || r.get::<_, bool>(0)))
 }
 
@@ -129,7 +135,7 @@ fn start_run(c: &mut Client, fp: &Fingerprint) -> Result<(i32, Vec<(u64, u64)>)>
                 content_length IS NOT DISTINCT FROM $2 AND etag IS NOT DISTINCT FROM $3
                 AND last_modified IS NOT DISTINCT FROM $4 AND file_mtime IS NOT DISTINCT FROM $5
                 AND gzip_crc32 IS NOT DISTINCT FROM $6 AND gzip_isize IS NOT DISTINCT FROM $7
-         FROM spansh.import_run WHERE source = $1 ORDER BY id DESC LIMIT 1",
+         FROM import_run WHERE source = $1 ORDER BY id DESC LIMIT 1",
         &[&fp.source, &fp.content_length, &fp.etag, &fp.last_modified, &fp.file_mtime, &fp.gzip_crc32, &fp.gzip_isize],
     )?;
     if let Some(r) = prev {
@@ -141,19 +147,19 @@ fn start_run(c: &mut Client, fp: &Fingerprint) -> Result<(i32, Vec<(u64, u64)>)>
             bail!("run {id} already imported this source completely");
         }
         let ranges = c
-            .query("SELECT first_ordinal, last_ordinal FROM spansh.import_batch WHERE run_id = $1 ORDER BY first_ordinal", &[&id])?
+            .query("SELECT first_ordinal, last_ordinal FROM import_batch WHERE run_id = $1 ORDER BY first_ordinal", &[&id])?
             .iter()
             .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64))
             .collect();
-        c.execute("UPDATE spansh.import_run SET status = 'running' WHERE id = $1", &[&id])?;
+        c.execute("UPDATE import_run SET status = 'running' WHERE id = $1", &[&id])?;
         return Ok((id, ranges));
     }
-    if c.query_one("SELECT EXISTS (SELECT 1 FROM spansh.system)", &[])?.get::<_, bool>(0) {
+    if c.query_one("SELECT EXISTS (SELECT 1 FROM system)", &[])?.get::<_, bool>(0) {
         bail!("tables already hold data from another source; run `init` first");
     }
     let id: i32 = c
         .query_one(
-            "INSERT INTO spansh.import_run (source, content_length, etag, last_modified, file_mtime, gzip_crc32, gzip_isize)
+            "INSERT INTO import_run (source, content_length, etag, last_modified, file_mtime, gzip_crc32, gzip_isize)
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
             &[&fp.source, &fp.content_length, &fp.etag, &fp.last_modified, &fp.file_mtime, &fp.gzip_crc32, &fp.gzip_isize],
         )?
@@ -167,14 +173,14 @@ fn commit_batch(c: &mut Client, run_id: i32, b: &Batch) -> Result<()> {
         if t.rows == 0 {
             continue;
         }
-        let mut w = tx.copy_in(&format!("COPY spansh.{name} ({cols}) FROM STDIN (FORMAT binary)"))?;
+        let mut w = tx.copy_in(&format!("COPY {name} ({cols}) FROM STDIN (FORMAT binary)"))?;
         w.write_all(HEADER)?;
         w.write_all(&t.buf)?;
         w.write_all(TRAILER)?;
         w.finish().with_context(|| format!("COPY into {name}"))?;
     }
     tx.execute(
-        "INSERT INTO spansh.import_batch (run_id, first_ordinal, last_ordinal, systems, json_bytes) VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO import_batch (run_id, first_ordinal, last_ordinal, systems, json_bytes) VALUES ($1, $2, $3, $4, $5)",
         &[&run_id, &(b.first_ordinal as i64), &(b.last_ordinal as i64), &(b.systems as i32), &(b.json_bytes as i64)],
     )?;
     tx.commit()?;
@@ -184,9 +190,9 @@ fn commit_batch(c: &mut Client, run_id: i32, b: &Batch) -> Result<()> {
 pub fn run(o: &Options) -> Result<Summary> {
     let start = Instant::now();
     let fp = source::fingerprint(&o.source)?;
-    let mut db = connect(&o.database)?;
+    let mut db = connect(&o.database, &o.schema)?;
     let (run_id, committed) = start_run(&mut db, &fp)?;
-    let mut p = Projector { dict: Dict::load(connect(&o.database)?)?, issues: Issues::new(run_id, o.issue_cap) };
+    let mut p = Projector { dict: Dict::load(connect(&o.database, &o.schema)?)?, issues: Issues::new(run_id, o.issue_cap) };
     let result = ingest(o, &mut db, &mut p, run_id, &committed, start);
     let status = match &result {
         Ok(s) if s.complete => "done",
@@ -195,7 +201,7 @@ pub fn run(o: &Options) -> Result<Summary> {
     };
     // Best effort: the batches themselves are the durable record.
     let _ = db.execute(
-        "UPDATE spansh.import_run SET status = $2, finished_at = now() WHERE id = $1",
+        "UPDATE import_run SET status = $2, finished_at = now() WHERE id = $1",
         &[&run_id, &status],
     );
     result

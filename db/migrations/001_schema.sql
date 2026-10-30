@@ -4,9 +4,7 @@
 -- Column order within each table puts 8-byte types first to minimise alignment padding.
 -- id64 values are u64 in the source, stored as BIGINT by bit reinterpretation (u64 as i64);
 -- every id64 observed so far is < 2^63, so stored values equal the source values.
-
-CREATE SCHEMA IF NOT EXISTS spansh;
-SET search_path = spansh;
+-- `init` creates the target schema (default `spansh`, see --schema) and sets search_path to it.
 
 -- Enum-like strings (allegiance, economy, body sub type, service, material, ...). One table, one
 -- global SMALLINT id space; the importer adds values as it meets them (committed before use).

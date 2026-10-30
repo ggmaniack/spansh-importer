@@ -413,7 +413,7 @@ fn finalize_commits_each_step_and_resumes_after_a_failed_check() {
     let out = run(&["finalize"], &url);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("VALIDATE CONSTRAINT body_signal_body_fkey"), "{err}");
+    assert!(err.contains("VALIDATE CONSTRAINT body_signal_body_id64_fkey"), "{err}");
 
     let constraints = |c: &mut Client| -> HashMap<String, bool> {
         c.query("SELECT conname::text, convalidated FROM pg_constraint WHERE connamespace = 'spansh'::regnamespace", &[])
@@ -425,9 +425,9 @@ fn finalize_commits_each_step_and_resumes_after_a_failed_check() {
     // Steps before the failure stayed committed; the failed check left its constraint unvalidated.
     let before = constraints(&mut c);
     assert_eq!(before.get("body_pkey"), Some(&true));
-    assert_eq!(before.get("body_system_fkey"), Some(&true));
-    assert_eq!(before.get("body_signal_body_fkey"), Some(&false));
-    assert_eq!(before.get("ring_body_fkey"), Some(&false));
+    assert_eq!(before.get("body_system_id64_fkey"), Some(&true));
+    assert_eq!(before.get("body_signal_body_id64_fkey"), Some(&false));
+    assert_eq!(before.get("ring_body_id64_fkey"), Some(&false));
 
     c.batch_execute("DELETE FROM body_signal WHERE body_id64 = 1").unwrap();
     let logs = std::env::temp_dir().join("spansh_test_finalize_logs");
@@ -438,5 +438,52 @@ fn finalize_commits_each_step_and_resumes_after_a_failed_check() {
     assert!(!log.contains("ADD CONSTRAINT body_pkey"), "finished steps must not run again:\n{log}");
     assert!(constraints(&mut c).values().all(|v| *v), "every constraint validated");
     let indexes: i64 = c.query_one("SELECT count(*) FROM pg_indexes WHERE schemaname = 'spansh' AND indexname LIKE '%_idx'", &[]).unwrap().get(0);
-    assert_eq!(indexes, 7);
+    assert_eq!(indexes, 9, "7 secondary + spatial + system_flags");
+}
+
+#[test]
+fn finalize_builds_route_flags_and_spatial_index_in_a_custom_schema() {
+    let url = fresh_db("spansh_test_schema");
+    run_ok(&["init", "--schema", "galaxy_b"], &url);
+    ingest_ok(&url, FIXTURE, &["--schema", "galaxy_b"]);
+    run_ok(&["finalize", "--schema", "galaxy_b"], &url);
+    let mut c = Client::connect(&url, NoTls).unwrap();
+    c.batch_execute("SET search_path = galaxy_b, public").unwrap();
+    let systems: i64 = c.query_one("SELECT count(*) FROM system", &[]).unwrap().get(0);
+    assert_eq!(systems, 100);
+
+    // Flags derived independently from the fixture's stars.
+    let mut checked = 0;
+    for s in fixture_systems() {
+        let stars: Vec<Value> = arr(&s, "bodies").into_iter().filter(|b| b["type"] == "Star").collect();
+        if stars.is_empty() {
+            continue;
+        }
+        let scoopable = |b: &Value| b["subType"].as_str().is_some_and(|t| t.len() > 2 && "OBAFGKM".contains(&t[..1]) && &t[1..3] == " (");
+        let main = |b: &Value| b["mainStar"] == true;
+        let near = |b: &Value| b["distanceToArrival"].as_f64().is_some_and(|d| d < 100.0);
+        let expected = (
+            stars.iter().any(|b| main(b) && scoopable(b)),
+            stars.iter().any(|b| !main(b) && near(b) && scoopable(b)),
+            stars.iter().any(|b| (main(b) || near(b)) && b["subType"] == "Neutron Star"),
+        );
+        let r = c
+            .query_one("SELECT main_star_scoopable, scoopable_nearby, neutron FROM system_flags WHERE id64 = $1", &[&(s["id64"].as_u64().unwrap() as i64)])
+            .unwrap();
+        assert_eq!((r.get(0), r.get(1), r.get(2)), expected, "{}", s["name"]);
+        checked += 1;
+    }
+    assert!(checked > 50, "{checked}");
+
+    // Nearest-neighbour search uses the spatial index and starts at Sol itself.
+    c.batch_execute("SET enable_seqscan = off").unwrap();
+    let sql = "SELECT name FROM system ORDER BY cube(array[x, y, z]) <-> cube(array[0, 0, 0]) LIMIT 3";
+    let plan: Vec<String> = c.query(&format!("EXPLAIN {sql}"), &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    assert!(plan.iter().any(|l| l.contains("system_coords_idx")), "{plan:?}");
+    let nearest: String = c.query(sql, &[]).unwrap()[0].get(0);
+    assert_eq!(nearest, "Sol");
+
+    // Nothing went into the default schema (created empty by fresh_db).
+    let default_rows: i64 = c.query_one("SELECT count(*) FROM spansh.system", &[]).unwrap().get(0);
+    assert_eq!(default_rows, 0);
 }

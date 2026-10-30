@@ -167,23 +167,23 @@ impl Dict {
     pub fn load(mut conn: Client) -> Result<Self> {
         let mut lookups: HashMap<String, HashMap<String, i16>> = HashMap::new();
         let mut next_id = 1;
-        for r in conn.query("SELECT id, kind, name FROM spansh.lookup", &[])? {
+        for r in conn.query("SELECT id, kind, name FROM lookup", &[])? {
             let id: i16 = r.get(0);
             next_id = next_id.max(id + 1);
             lookups.entry(r.get(1)).or_default().insert(r.get(2), id);
         }
         let commodities = conn
-            .query("SELECT id, symbol, name, category FROM spansh.commodity", &[])?
+            .query("SELECT id, symbol, name, category FROM commodity", &[])?
             .iter()
             .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
             .collect();
         let module_variants = conn
-            .query("SELECT id, module_id, class, category, rating, symbol, name, ship FROM spansh.module_variant", &[])?
+            .query("SELECT id, module_id, class, category, rating, symbol, name, ship FROM module_variant", &[])?
             .iter()
             .map(|r| ((r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6), r.get(7)), r.get(0)))
             .collect();
         let ships = conn
-            .query("SELECT id, symbol, name FROM spansh.ship", &[])?
+            .query("SELECT id, symbol, name FROM ship", &[])?
             .iter()
             .map(|r| (r.get(0), (r.get(1), r.get(2))))
             .collect();
@@ -196,7 +196,7 @@ impl Dict {
         }
         let id = self.next_id;
         anyhow::ensure!(id < i16::MAX, "lookup id space exhausted");
-        self.conn.execute("INSERT INTO spansh.lookup (id, kind, name) VALUES ($1, $2, $3)", &[&id, &kind, &name])?;
+        self.conn.execute("INSERT INTO lookup (id, kind, name) VALUES ($1, $2, $3)", &[&id, &kind, &name])?;
         self.next_id += 1;
         self.lookups.entry(kind.to_owned()).or_default().insert(name.to_owned(), id);
         Ok(id)
@@ -208,7 +208,7 @@ impl Dict {
             return Ok(*known == v);
         }
         self.conn.execute(
-            "INSERT INTO spansh.commodity (id, symbol, name, category) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO commodity (id, symbol, name, category) VALUES ($1, $2, $3, $4)",
             &[&id, &v.0, &v.1, &v.2],
         )?;
         self.commodities.insert(id, v);
@@ -221,7 +221,7 @@ impl Dict {
         }
         let id = self.module_variants.len() as i32 + 1;
         self.conn.execute(
-            "INSERT INTO spansh.module_variant (id, module_id, class, category, rating, symbol, name, ship) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO module_variant (id, module_id, class, category, rating, symbol, name, ship) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[&id, &v.0, &v.1, &v.2, &v.3, &v.4, &v.5, &v.6],
         )?;
         self.module_variants.insert(v, id);
@@ -232,7 +232,7 @@ impl Dict {
         if let Some(known) = self.ships.get(&id) {
             return Ok(*known == v);
         }
-        self.conn.execute("INSERT INTO spansh.ship (id, symbol, name) VALUES ($1, $2, $3)", &[&id, &v.0, &v.1])?;
+        self.conn.execute("INSERT INTO ship (id, symbol, name) VALUES ($1, $2, $3)", &[&id, &v.0, &v.1])?;
         self.ships.insert(id, v);
         Ok(true)
     }

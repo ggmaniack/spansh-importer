@@ -25,6 +25,44 @@ entities (`commodity`, `ship`, `module_variant`) are keyed by Frontier id. New v
 and committed on first sight through a separate connection, so a batch only ever references rows
 that are already committed.
 
+## Database connection
+
+`src/db.rs` resolves settings the way libpq does, in this order:
+1. the connection string (`--database` / `DATABASE_URL`), as a URL or `key=value` pairs;
+2. `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`, `PGSSLROOTCERT` for anything
+   the string leaves out (an empty variable counts as unset);
+3. the password file (`PGPASSFILE`, else `~/.pgpass` or `%APPDATA%\postgresql\pgpass.conf`): the
+   first `host:port:database:user:password` line that matches, with `*` wildcards and `\:` / `\\`
+   escapes;
+4. defaults: `localhost:5432`, user `postgres`, database `elite`, `sslmode=prefer`.
+
+The driver only knows `disable`, `prefer` and `require`, so `sslmode` and `sslrootcert` are taken out
+of the string first and mapped onto a `native-tls` connector:
+- **`prefer` / `require`:** no certificate checks, unless `require` comes with an `sslrootcert`, which
+  then verifies the chain as libpq does;
+- **`verify-ca`:** checks the chain;
+- **`verify-full`:** checks the chain and the host name.
+
+`sslrootcert` replaces the system's trusted roots; `sslrootcert=system` keeps them. `native-tls` uses
+SChannel on Windows, Security.framework on macOS and OpenSSL on Linux, so the Linux build needs
+OpenSSL's development headers, and the binary needs `libssl` at run time. Error and log messages
+describe the target as `user@host:port/db (sslmode=…)`, never with the password.
+
+Tested against a local TLS-only server (self-signed certificate, scram passwords):
+- `disable` is refused;
+- `prefer` and `require` connect;
+- `verify-full` fails without the root certificate and on a host name mismatch, and succeeds with it;
+- `verify-ca` ignores the host name;
+- the URL form, the `key=value` form, `PG*` variables and `PGPASSFILE` all work;
+- the password never appears in the logs.
+
+## Schema selection
+
+`--schema` (or `SPANSH_SCHEMA`) picks the schema for all tables. The default is `spansh`. Every
+connection sets `search_path = <schema>, public`, and all SQL uses unqualified names. The name must be
+a lower-case identifier, so it can go into statements without quoting. `init` drops and recreates only
+that schema, so two imports can live side by side and be swapped with `ALTER SCHEMA ... RENAME`.
+
 ## Correctness rules
 
 - **Nothing is dropped.** Unknown keys, values of the wrong type and conflicting catalogue data go to
@@ -75,9 +113,18 @@ It retries up to 20 times in a row, backing off up to 60 s between attempts.
 3. `VALIDATE CONSTRAINT` for each foreign key, which checks the existing rows under a lock that
    still allows reads and writes;
 4. secondary indexes (`CREATE INDEX IF NOT EXISTS`);
-5. `ANALYZE`.
+5. `ANALYZE`;
+6. unless `--no-spatial`, `003_spatial.sql`:
+   - the `cube` extension (bundled with PostgreSQL), installed into `public` so every import schema
+     can use it;
+   - a GiST index on `cube(array[x, y, z])`. Queries must use that exact expression to hit the index.
+7. unless `--no-flags`, `004_flags.sql`: the `system_flags` materialized view and its unique index.
+   - It's derived from star bodies.
+   - "Scoopable" means sub-type `O`, `B`, `A`, `F`, `G`, `K` or `M`, giants included.
+   - "Nearby" means under 100 ls from arrival, Spansh's own cut-off.
+   - It is built once. Drop it and re-run `finalize` to rebuild it.
 
-Every constraint and index has an explicit name. Before each statement, `finalize` skips it if:
+Every constraint and index has an explicit name, the same name PostgreSQL would generate by default, so databases finalized by older versions are recognised. Before each statement, `finalize` skips it if:
 - its constraint already exists (`ADD CONSTRAINT`); or
 - its constraint is already validated (`VALIDATE CONSTRAINT`).
 
@@ -158,7 +205,8 @@ The integration tests in `tests/ingest.rs` need a PostgreSQL server at `$TEST_PG
 - resume without duplicates;
 - rollback of a failed batch;
 - refusal to resume a changed source;
-- `finalize` resuming after a failed foreign key check.
+- `finalize` resuming after a failed foreign key check;
+- `system_flags` against flags derived independently from the fixture, the spatial index being used for a nearest-neighbour query, and `--schema`.
 
 CI (`.github/workflows/ci.yml`) runs clippy and all tests against a `postgres:18` service container.
 Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds Linux x86_64, Windows x86_64

@@ -1,3 +1,4 @@
+mod db;
 mod ingest;
 mod pgcopy;
 mod project;
@@ -12,8 +13,6 @@ use clap::{Parser, Subcommand};
 
 use crate::report::Level;
 
-const DEFAULT_DB: &str = "postgres://postgres@localhost:5432/elite";
-
 #[derive(Parser)]
 #[command(about = "Spansh galaxy dump importer")]
 struct Cli {
@@ -22,6 +21,17 @@ struct Cli {
     /// Directory for log files (<command>-<UTC timestamp>.log).
     #[arg(long, global = true, default_value = "logs")]
     log_dir: PathBuf,
+    /// Database schema holding the imported tables.
+    #[arg(long, global = true, env = "SPANSH_SCHEMA", default_value = "spansh", value_parser = schema_name)]
+    schema: String,
+}
+
+/// Lower-case SQL identifier, so it can be used in statements without quoting.
+fn schema_name(s: &str) -> Result<String, String> {
+    let ok = s.len() <= 63
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if ok { Ok(s.to_owned()) } else { Err("use lower-case letters, digits and _ (not starting with a digit)".into()) }
 }
 
 #[derive(Subcommand)]
@@ -36,18 +46,20 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         workers: usize,
     },
-    /// Drop and recreate the `spansh` schema, empty, ready for loading.
+    /// Drop and recreate the import schema, empty, ready for loading.
     Init {
-        #[arg(long, env = "DATABASE_URL", default_value = DEFAULT_DB)]
-        database: String,
+        /// Connection string (URL or key=value); PG* variables and the password file fill the rest.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database: Option<String>,
     },
     /// Stream a dump into the database; resumes an interrupted run of the same source.
     Ingest {
         /// Dump file path or http(s) URL (.json or .json.gz).
         #[arg(long)]
         source: String,
-        #[arg(long, env = "DATABASE_URL", default_value = DEFAULT_DB)]
-        database: String,
+        /// Connection string (URL or key=value); PG* variables and the password file fill the rest.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database: Option<String>,
         /// Commit after this many MiB of encoded COPY data.
         #[arg(long, default_value_t = 64)]
         batch_mib: usize,
@@ -58,10 +70,17 @@ enum Cmd {
         #[arg(long, default_value_t = 100_000)]
         issue_cap: u64,
     },
-    /// Add primary keys, foreign keys and indexes after loading.
+    /// Add primary keys, foreign keys and indexes after loading; resumes an interrupted run.
     Finalize {
-        #[arg(long, env = "DATABASE_URL", default_value = DEFAULT_DB)]
-        database: String,
+        /// Connection string (URL or key=value); PG* variables and the password file fill the rest.
+        #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
+        database: Option<String>,
+        /// Skip the 3D spatial index on system coordinates (cube extension).
+        #[arg(long)]
+        no_spatial: bool,
+        /// Skip the system_flags route-planning view.
+        #[arg(long)]
+        no_flags: bool,
     },
 }
 
@@ -69,12 +88,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let (command, about) = match &cli.cmd {
         Cmd::Survey { source, workers, .. } => ("survey", format!("survey {source} with {workers} workers")),
-        Cmd::Init { .. } => ("init", "recreate schema spansh".to_owned()),
-        Cmd::Ingest { source, batch_mib, .. } => ("ingest", format!("ingest {source}, batches of {batch_mib} MiB")),
-        Cmd::Finalize { .. } => ("finalize", "add keys and indexes".to_owned()),
+        Cmd::Init { .. } => ("init", format!("recreate schema {}", cli.schema)),
+        Cmd::Ingest { source, batch_mib, .. } => ("ingest", format!("ingest {source} into schema {}, batches of {batch_mib} MiB", cli.schema)),
+        Cmd::Finalize { .. } => ("finalize", format!("add keys and indexes in schema {}", cli.schema)),
     };
     report::start(command, &cli.log_dir, &about)?;
-    match run(cli.cmd) {
+    match run(cli.cmd, &cli.schema) {
         Ok(after) => {
             report::finish(true);
             after();
@@ -90,7 +109,7 @@ fn main() -> Result<()> {
 }
 
 /// Runs the command; the returned closure prints its results once the status display is closed.
-fn run(cmd: Cmd) -> Result<Box<dyn FnOnce()>> {
+fn run(cmd: Cmd, schema: &str) -> Result<Box<dyn FnOnce()>> {
     Ok(match cmd {
         Cmd::Survey { source, out, workers } => {
             let report = survey::run(source::open(&source)?, workers, &source)?;
@@ -101,15 +120,15 @@ fn run(cmd: Cmd) -> Result<Box<dyn FnOnce()>> {
             })
         }
         Cmd::Init { database } => {
-            ingest::init(&database)?;
+            ingest::init(&database.unwrap_or_default(), schema)?;
             Box::new(|| ())
         }
         Cmd::Ingest { source, database, batch_mib, max_systems, issue_cap } => {
-            let s = ingest::run(&ingest::Options { source, database, batch_mib, max_systems, issue_cap })?;
+            let s = ingest::run(&ingest::Options { source, database: database.unwrap_or_default(), schema: schema.to_owned(), batch_mib, max_systems, issue_cap })?;
             Box::new(move || s.print())
         }
-        Cmd::Finalize { database } => {
-            ingest::finalize(&database)?;
+        Cmd::Finalize { database, no_spatial, no_flags } => {
+            ingest::finalize(&database.unwrap_or_default(), schema, !no_spatial, !no_flags)?;
             Box::new(|| ())
         }
     })
