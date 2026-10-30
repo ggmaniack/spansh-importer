@@ -1,65 +1,83 @@
 # spansh-importer
 
-Streams the [Spansh](https://spansh.co.uk/dumps) Elite Dangerous galaxy dump into normalized
-PostgreSQL tables. The full galaxy (`galaxy.json.gz`: 110 GB compressed, about 620 GB of JSON, 203M
-systems, 610M bodies) loads in about 3 hours on one desktop. The importer uses about 300 MB of RAM and
-needs no local copy of the dump.
+Load the whole Elite Dangerous galaxy into your own PostgreSQL database.
 
-- **Streaming:** reads a local file or an HTTP(S) URL. `.gz` is decompressed on the fly, and nothing
-  is staged on disk.
-- **Fast:** each table is written with hand-encoded binary `COPY`. Keys and indexes are built
-  once, after the load.
-- **Lossless:** every source field ends up in exactly one place:
-  - a typed column or child row; or
-  - the owning entity's `extra` JSONB column, for unknown fields and values of the wrong type,
-    each logged to `import_issue`.
-- **Resumable:** batches commit atomically together with their checkpoint, so an interrupted run
-  continues exactly where it stopped, with no duplicates.
-  - If the source file changed in the meantime, it refuses to resume.
-  - Over HTTP, a dropped connection is resumed in-stream with `Range` + `If-Range`.
-- **Bounded memory:** batches are capped by encoded size (`--batch-mib`), not by row count.
+[Spansh](https://spansh.co.uk/dumps) publishes daily dumps of everything players have
+explored: about 200 million star systems, 600 million planets and stars, every station, market
+price and faction. This tool turns those dumps into ordinary database tables you can query with
+SQL. You can use them for route planning, trade analysis, exploration statistics, or to back your
+own tools.
 
-## Quick start
+- **One command per step:** create the tables, import, finish.
+- **No big download needed:** it reads the dump straight from Spansh's server. Point it at a local
+  copy instead if you have one.
+- **Safe to interrupt:** stop it any time (Ctrl-C, reboot, lost connection) and run the same command
+  again to continue where it left off. Nothing is imported twice.
+- **Nothing gets lost:** fields it doesn't recognise are kept, not dropped.
+- **Modest hardware:** uses about 300 MB of RAM. The full galaxy takes about 3 hours on a
+  desktop PC.
 
-Requirements: PostgreSQL 15 or newer (developed on 18) and a database to load into. To build from
-source you also need a Rust toolchain (edition 2024, Rust 1.85 or newer).
+## What you need
+
+- **PostgreSQL 15 or newer** on the same machine or reachable over the network, with an empty
+  database for the import.
+- **Disk space** for the database, depending on which dump you import:
+
+| Dump | Download size | Contents | Database size | Import time |
+|---|---:|---|---:|---:|
+| `galaxy.json.gz` | 110 GB | everything | ~260 GB | ~3 h |
+| `galaxy_populated.json.gz` | 4.3 GB | inhabited systems only, with all stations and markets | 12 GB | ~8 min |
+| `galaxy_stations.json.gz` | 4.3 GB | systems that have stations | | |
+| `galaxy_1month.json.gz` | 5.2 GB | systems updated in the last month | | |
+| `galaxy_7days.json.gz` | 3 GB | systems updated in the last 7 days | | |
+| `galaxy_1day.json.gz` | 1.1 GB | systems updated in the last day | | |
+
+All dumps are at `https://downloads.spansh.co.uk/<name>`. Sizes and times were measured on a
+16-thread desktop with an NVMe SSD. The full-galaxy database size is approximate.
+
+## Install
+
+Download the archive for your system from the [releases page](../../releases) and unpack it. It
+contains the `spansh-importer` program, this README and the `db` folder.
+
+To build from source instead, install [Rust](https://rustup.rs/) and run `cargo build --release`.
+The program is then at `target/release/spansh-importer`.
+
+## Import the galaxy
+
+**1. Create a database** (once):
 
 ```sh
-cargo build --release
-export DATABASE_URL=postgres://postgres@localhost:5432/elite
-
-spansh-importer init                      # (re)create the empty `spansh` schema
-spansh-importer ingest --source https://downloads.spansh.co.uk/galaxy.json.gz
-spansh-importer finalize                  # primary keys, foreign keys, indexes, ANALYZE
+createdb elite
 ```
 
-Prebuilt binaries for Linux, Windows and macOS are attached to each
-[GitHub release](../../releases).
+**2. Tell the importer where it is.** The default is `postgres://postgres@localhost:5432/elite`. If
+yours differs, set `DATABASE_URL` or pass `--database` to each command:
 
-## Commands
+```sh
+export DATABASE_URL=postgres://user:password@host:5432/elite     # Linux / macOS
+$env:DATABASE_URL = "postgres://user:password@host:5432/elite"   # Windows PowerShell
+```
 
-| Command | What it does |
-|---|---|
-| `init` | Drops and recreates schema `spansh` from `db/migrations/001_schema.sql` (embedded in the binary). **Destroys any previous import.** |
-| `ingest --source <path\|url>` | Streams a dump into the tables. Re-running the same command resumes an interrupted run. |
-| `finalize` | Runs `002_constraints.sql` in one transaction: primary keys (which also prove there are no duplicates), foreign keys, secondary indexes, `ANALYZE`. |
-| `survey <path\|url> --out report.txt` | Read-only data profiling. For every JSON path it reports types, ranges, distinct values and duplicate ids. It doesn't need a database. |
+**3. Run the three steps:**
 
-`ingest` options:
+```sh
+spansh-importer init
+spansh-importer ingest --source https://downloads.spansh.co.uk/galaxy.json.gz
+spansh-importer finalize
+```
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--database` | `$DATABASE_URL`, else `postgres://postgres@localhost:5432/elite` | Target database |
-| `--batch-mib` | `64` | Commit after this many MiB of encoded COPY data. One batch is the unit of resume. |
-| `--max-systems` | | Stop after N systems. The run is marked `stopped` and can be resumed later. |
-| `--issue-cap` | `100000` | Maximum `import_issue` rows stored per run. Every issue is still counted. |
+- **`init`** creates the empty tables. It deletes any previous import in that database.
+- **`ingest`** streams the dump into the tables. This is the long step.
+- **`finalize`** checks the data for duplicates and broken references, then builds the indexes that
+  make queries fast. For the full galaxy this takes from several minutes to about an hour.
 
-Any Spansh dump with the one-system-per-line layout works: `galaxy.json.gz`, `galaxy_1day`,
-`galaxy_7days`, `galaxy_1month`, `galaxy_populated`, `galaxy_stations`.
+To import a file you've already downloaded, give its path instead of the URL:
+`--source D:\dumps\galaxy.json.gz`.
 
-## Progress and logs
+## While it runs
 
-All commands show the same status block in the terminal, redrawn twice a second:
+Each command shows a live status in the terminal:
 
 ```
 ingest  [#######.............]  38.7%  45.8 GB / 118.5 GB  1h12m elapsed, ETA 1h54m
@@ -67,137 +85,136 @@ batch 2478, 66067109 systems (+0 skipped), 239595 MB JSON (55 MB/s), 166315 MB C
 warnings 0  errors 0  log logs\ingest-20261030-080506.log
 ```
 
-- **Progress:** for `ingest` and `survey`, the bar counts bytes of the source file read (compressed
-  bytes for `.gz`). For `finalize`, it counts SQL steps, plus the current index build's own
-  progress from `pg_stat_progress_create_index`.
-- **Redirected stderr:** when stderr is not a terminal, the status is printed as a single line once
-  a minute instead.
+Every run also writes a log file in the `logs` folder, named after the command and its start time.
+The log has a progress line every minute plus any warnings or errors, so you can check on a long
+import later or from another machine. Use `--log-dir` to put logs elsewhere.
 
-Every run also writes its own log file, `<log-dir>/<command>-<YYYYMMDD-HHMMSS>.log`. The
-timestamp is UTC, and `--log-dir` defaults to `logs`. Every line has the same four fields in
-[logfmt](https://brandur.org/logfmt):
+## If it stops
 
+Run **exactly the same command again**. `ingest` skips everything that was already saved and
+continues, and `finalize` skips the steps that already finished.
+
+There are a few cases where the importer refuses to continue instead:
+
+| Message | Why | What to do |
+|---|---|---|
+| `source changed since run N` | The dump file is different from the one the import started with. Spansh publishes a new dump every day around 06:40 UTC. | Run `init` and start over, or import a local copy you downloaded once. |
+| `already imported this source completely` | This dump is already fully in the database. | Nothing; run `finalize` if you haven't. |
+| `tables already hold data from another source` | The database holds a different import. | Run `init` first (deletes it). |
+
+A dropped internet connection on its own is not a problem: the importer reconnects and carries on
+from the exact byte, as long as Spansh hasn't replaced the file in the meantime.
+
+## Updating to a newer dump
+
+Imports aren't incremental. To move to a newer dump, run `init` and the three steps again. Keep the
+old database for queries meanwhile by importing into a second database, then switch.
+
+## Using the data
+
+Everything is in the `spansh` schema. Run `SET search_path = spansh;` first, or prefix the table
+names.
+
+Find a system:
+
+```sql
+SELECT name, x, y, z, population FROM system WHERE name = 'Sol';
 ```
-ts=2026-10-30T08:06:06.512Z level=INFO event=progress msg="[#.......] 5.2%  6.1 GB / 118.5 GB ... | batch 120, ..."
-ts=2026-10-30T09:20:41.007Z level=WARN event=reconnect msg="connection lost at byte 102177800192 (...); reconnect 1 in 2s"
+
+Where to sell Gold for the best price:
+
+```sql
+SELECT st.name AS station, sy.name AS system, m.sell_price, m.demand
+FROM market_commodity m
+JOIN commodity c ON c.id = m.commodity_id
+JOIN station st  ON st.id = m.station_id
+JOIN system sy   ON sy.id64 = st.system_id64
+WHERE c.name = 'Gold' AND m.demand > 0
+ORDER BY m.sell_price DESC
+LIMIT 10;
 ```
 
-- **Levels:** `INFO`, `WARN` and `ERROR`.
-- **Events:** `start`, `progress` (once a minute), `step` (each `finalize` statement and its
-  duration), `issue` (a data problem also stored in `import_issue`), `reconnect`, `error`,
-  `summary`, and `done` / `failed`.
-- **Rate limit:** each warning or error event is written at most 20 times per run. After that,
-  repeats are only counted, and a `suppressed` line with the count follows each progress line. This
-  keeps the log a few hundred lines long even for a 3-hour import.
+Landable bodies in a system, lowest gravity first:
 
-## Resume and source identity
+```sql
+SELECT b.name, t.name AS type, b.gravity, b.distance_to_arrival
+FROM body b
+JOIN system s ON s.id64 = b.system_id64
+LEFT JOIN lookup t ON t.id = b.sub_type
+WHERE s.name = 'Sol' AND b.is_landable
+ORDER BY b.gravity;
+```
 
-Every run records a fingerprint of its source in `import_run`:
+Stations that sell a ship:
 
-- **HTTP:** `Content-Length`, `ETag`, `Last-Modified`, plus the gzip trailer (CRC32 and size).
-- **Local file:** canonical path, size, mtime, plus the gzip trailer.
+```sql
+SELECT st.name, sy.name AS system
+FROM station st JOIN system sy ON sy.id64 = st.system_id64
+WHERE st.ship_ids @> ARRAY(SELECT id FROM ship WHERE name = 'Python');
+```
 
-Each committed batch inserts its system range into `import_batch` in the same transaction as its
-data. On restart:
+Some columns store names as small numbers to save space, for example `body.sub_type`,
+`system.primary_economy` and `station.type`. Join them to `lookup` to get the text, as in the third example.
 
-| Situation | Result |
-|---|---|
-| Same source, unchanged | Committed ranges are skipped and the import continues. |
-| Same source, fingerprint differs | Refused. Run `init` and start over. |
-| Previous run finished (`done`) | Refused, so a dump is never imported twice. |
-| Tables hold data from a different source | Refused. Run `init` first. |
+What's in each table:
 
-Spansh rebuilds the galaxy dump once a day, around 06:40 UTC. Within the same download, a dropped
-HTTP connection resumes from the exact byte, and a file replaced mid-download aborts instead of
-splicing two versions together. To resume across a rebuild, download the dump and import the
-local file instead.
-
-## Schema
-
-All tables live in schema `spansh`. See [docs/field-mapping.md](docs/field-mapping.md) for where each
-source field goes.
-
-| Table | Rows (full galaxy, 2026-10-30) | Contents |
+| Table | Rows (full galaxy) | What it holds |
 |---|---:|---|
-| `system` | 203,339,502 | coordinates, allegiance, economy, population, powers, timestamps |
-| `body` | 609,790,151 | orbital and physical data, parents (arrays), composition (41 percent columns) |
-| `ring` / `ring_signal` | 95.2M / 3.4M | rings and belts, with their signals |
-| `body_signal` | 31.5M | biological, geological and other signal counts |
-| `station` | 864,950 | stations and fleet carriers, services, ship and module-variant id arrays |
-| `station_economy` | 1.3M | economy shares |
-| `market_commodity` | 104.5M | buy/sell prices, demand, supply |
-| `system_faction` / `faction_state` | 661k / 250k | factions and their active, pending and recovering states |
-| `power_conflict`, `thargoid_war` | | Powerplay conflict progress, Thargoid war state |
-| `lookup` | | enum-like strings (economy, government, body type, ...) as `SMALLINT` ids |
-| `commodity`, `ship`, `module_variant` | | Frontier catalogue entities |
-| `import_run`, `import_batch`, `import_issue` | | run fingerprints, resume checkpoints, logged problems |
+| `system` | 203M | name, coordinates, allegiance, economy, population, Powerplay |
+| `body` | 610M | stars and planets: orbits, physical data, atmosphere, materials, parents |
+| `ring` | 95M | rings and asteroid belts |
+| `body_signal`, `ring_signal` | 31M, 3.4M | biological, geological and other signals |
+| `station` | 865k | stations, outposts, settlements and fleet carriers with their services |
+| `market_commodity` | 105M | commodity prices, supply and demand per station |
+| `station_economy` | 1.3M | station economies |
+| `system_faction`, `faction_state` | 661k, 250k | minor factions and their states |
+| `commodity`, `ship`, `module_variant` | | names of commodities, ships and outfitting modules |
+| `lookup` | | text for the numeric name columns |
 
-Body `id64` equals `system_id64 | body_id << 55`, which was verified on all 610M bodies.
+[docs/field-mapping.md](docs/field-mapping.md) lists where every field from the dump ends up.
 
-## Performance
+## Command reference
 
-Full `galaxy.json.gz`, streamed over HTTP, single worker, on a 16-thread desktop with an NVMe SSD:
-
-| | |
+| Command | Purpose |
 |---|---|
-| Wall time | 2 h 58 min (10,698 s) |
-| Throughput | 58 MB/s of JSON, 19k systems/s, 98k rows/s |
-| Rows written | 1.05 billion |
-| Peak memory | 315 MB |
-| Database size | 223 GB before `finalize` |
-| Time split | read + gunzip 16%, JSON parse 32%, projection 28%, COPY + commit 24% |
+| `init` | Create empty tables (deletes any previous import). |
+| `ingest --source <url or file>` | Import a dump; run again to resume. |
+| `finalize` | Check the data and build indexes; run again to resume. |
+| `survey <url or file> --out report.txt` | Profile a dump without importing it: every field, its types and values. No database needed. |
 
-PostgreSQL settings for bulk loading are in [db/bulkload.conf](db/bulkload.conf). The settings that
-matter most:
-- `wal_level = minimal`: COPY into a table created in the same transaction skips WAL.
-- `max_wal_size = 32GB`
-- a large `maintenance_work_mem` for `finalize`
+Options:
 
-Durability (`fsync`, `synchronous_commit`) stays on.
+| Option | Default | Meaning |
+|---|---|---|
+| `--database` | `$DATABASE_URL`, else `postgres://postgres@localhost:5432/elite` | Database to use |
+| `--log-dir` | `logs` | Where log files go |
+| `--batch-mib` | `64` | `ingest`: how much data to save at a time. An interruption loses at most one batch. |
+| `--max-systems` | | `ingest`: stop after this many systems, e.g. for a quick trial. Resumable. |
+| `--issue-cap` | `100000` | `ingest`: how many data problems to store in `import_issue`; all are counted. |
+| `--workers` | `8` | `survey`: threads to use |
 
-## Development
+## Faster imports
 
-```sh
-cargo test                       # unit tests + integration tests
-TEST_PG=postgres://postgres@localhost:5432 cargo test
-```
+The defaults of a fresh PostgreSQL install work, but a large import is much faster with bulk-load
+settings. [db/bulkload.conf](db/bulkload.conf) is the configuration used for the timings above.
+Include it from your `postgresql.conf` and adjust the memory values to your machine.
 
-The integration tests in `tests/ingest.rs` need a PostgreSQL server (`$TEST_PG`, which defaults to
-`postgres://postgres@localhost:5432` with trust auth). Each test creates and drops its own
-`spansh_test_*` database. They cover:
-- the row counts the 100-system fixture should produce;
-- a field-by-field round-trip of systems, bodies and stations;
-- resume without duplicates;
-- rollback of a failed batch;
-- refusal to resume a changed source.
+## More documentation
 
-On Windows, [db/pg.ps1](db/pg.ps1) wraps `pg_ctl` for a native PostgreSQL install whose data
-directory is `F:\pgdata` (`.\db\pg.ps1 start|stop|status`). Adjust the paths for your machine.
-
-Repository layout:
-
-| Path | Contents |
-|---|---|
-| `src/main.rs` | CLI |
-| `src/source.rs` | file/HTTP streaming, reconnect, source fingerprint |
-| `src/project.rs` | JSON to row projection, lookup and catalogue dictionaries, issue log |
-| `src/pgcopy.rs` | binary COPY encoder |
-| `src/ingest.rs` | batching, transactions, resume |
-| `src/survey.rs` | parallel data profiler |
-| `db/migrations/` | schema (load phase) and constraints (after load) |
-| `docs/research-notes.md` | dump format, data quirks, design decisions |
-| `docs/survey/` | survey reports of each Spansh dump, including the full galaxy |
+- [docs/technical.md](docs/technical.md): how the importer works, resume details, log format,
+  performance breakdown, development and testing.
+- [docs/field-mapping.md](docs/field-mapping.md): where each field of the dump goes.
+- [docs/research-notes.md](docs/research-notes.md): notes on the dump format and its quirks.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-## Data and acknowledgements
+## Acknowledgements
 
-The data comes from [Spansh](https://spansh.co.uk/), built from player-submitted EDDN journal
-data. Elite Dangerous is a trademark of Frontier Developments plc. This project is not affiliated
-with Spansh or Frontier.
+The data comes from [Spansh](https://spansh.co.uk/), built from player-submitted
+[EDDN](https://github.com/EDCD/EDDN) data. Elite Dangerous is a trademark of Frontier Developments
+plc. This project is not affiliated with Spansh or Frontier.
 
 The test fixture `tests/fixtures/spanshtools-100.json.gz` comes from
-[Merovech/Elite.SpanshTools](https://github.com/Merovech/Elite.SpanshTools) (MIT). See
-[tests/fixtures/README.md](tests/fixtures/README.md).
+[Merovech/Elite.SpanshTools](https://github.com/Merovech/Elite.SpanshTools) (MIT).

@@ -53,8 +53,9 @@ pub fn init(database: &str) -> Result<()> {
     Ok(())
 }
 
-/// Adds primary keys, foreign keys and indexes after the load, in one transaction. Statements run
-/// one at a time so each can be reported; a second connection reports index build progress.
+/// Adds primary keys, foreign keys and indexes after the load. Each statement commits on its own
+/// and finished ones are skipped, so an interrupted run resumes; a second connection reports index
+/// build progress.
 pub fn finalize(database: &str) -> Result<()> {
     let steps = statements(include_str!("../db/migrations/002_constraints.sql"));
     let done = Arc::new(AtomicU64::new(0));
@@ -78,22 +79,41 @@ pub fn finalize(database: &str) -> Result<()> {
     });
     let result = (|| -> Result<()> {
         let mut c = connect(database)?;
-        let mut tx = c.transaction()?;
+        let mut skipped = 0;
         for (i, sql) in steps.iter().enumerate() {
             let label = sql.split_whitespace().collect::<Vec<_>>().join(" ");
             report::detail(format!("step {}/{}: {label}", i + 1, steps.len()));
-            let t = Instant::now();
-            tx.batch_execute(sql).with_context(|| format!("finalize step {}: {label}", i + 1))?;
-            report::log(Level::Info, "step", &format!("{label} ({})", report::hms(t.elapsed())));
+            if step_done(&mut c, sql)? {
+                skipped += 1;
+            } else {
+                let t = Instant::now();
+                c.batch_execute(sql).with_context(|| format!("finalize step {}: {label}", i + 1))?;
+                report::log(Level::Info, "step", &format!("{label} ({})", report::hms(t.elapsed())));
+            }
             done.fetch_add(1, Ordering::Relaxed);
         }
-        report::detail("committing");
-        tx.commit()?;
+        if skipped > 0 {
+            report::log(Level::Info, "resumed", &format!("{skipped} steps were already done and skipped"));
+        }
         Ok(())
     })();
     finished.store(true, Ordering::Relaxed);
     let _ = poller.join();
     result
+}
+
+/// True when a step's named constraint already exists (`ADD CONSTRAINT`) or is already validated
+/// (`VALIDATE CONSTRAINT`). Other steps are idempotent (`SET`, `CREATE INDEX IF NOT EXISTS`, `ANALYZE`).
+fn step_done(c: &mut Client, sql: &str) -> Result<bool> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let name_after = |a: &str, b: &str| words.windows(3).find(|w| w[0].eq_ignore_ascii_case(a) && w[1].eq_ignore_ascii_case(b)).map(|w| w[2]);
+    let (name, need_valid) = match (name_after("VALIDATE", "CONSTRAINT"), name_after("ADD", "CONSTRAINT")) {
+        (Some(n), _) => (n, true),
+        (None, Some(n)) => (n, false),
+        (None, None) => return Ok(false),
+    };
+    let row = c.query_opt("SELECT convalidated FROM pg_constraint WHERE conname = $1 AND connamespace = 'spansh'::regnamespace", &[&name])?;
+    Ok(row.is_some_and(|r| !need_valid || r.get::<_, bool>(0)))
 }
 
 /// Splits a migration into statements (no function bodies or quoted `;` in these files).

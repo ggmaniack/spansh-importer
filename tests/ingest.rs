@@ -402,3 +402,41 @@ fn refuses_to_resume_a_changed_source() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("source changed"), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[test]
+fn finalize_commits_each_step_and_resumes_after_a_failed_check() {
+    let url = fresh_db("spansh_test_finalize");
+    ingest_ok(&url, FIXTURE, &[]);
+    let mut c = db(&url);
+    // An orphan signal row makes the body_signal foreign key check fail.
+    c.batch_execute("INSERT INTO body_signal (body_id64, signal, count) VALUES (1, 1, 1)").unwrap();
+    let out = run(&["finalize"], &url);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("VALIDATE CONSTRAINT body_signal_body_fkey"), "{err}");
+
+    let constraints = |c: &mut Client| -> HashMap<String, bool> {
+        c.query("SELECT conname::text, convalidated FROM pg_constraint WHERE connamespace = 'spansh'::regnamespace", &[])
+            .unwrap()
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    };
+    // Steps before the failure stayed committed; the failed check left its constraint unvalidated.
+    let before = constraints(&mut c);
+    assert_eq!(before.get("body_pkey"), Some(&true));
+    assert_eq!(before.get("body_system_fkey"), Some(&true));
+    assert_eq!(before.get("body_signal_body_fkey"), Some(&false));
+    assert_eq!(before.get("ring_body_fkey"), Some(&false));
+
+    c.batch_execute("DELETE FROM body_signal WHERE body_id64 = 1").unwrap();
+    let logs = std::env::temp_dir().join("spansh_test_finalize_logs");
+    let _ = std::fs::remove_dir_all(&logs);
+    run_ok(&["finalize", "--log-dir", logs.to_str().unwrap()], &url);
+    let log = std::fs::read_dir(&logs).unwrap().map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap()).collect::<String>();
+    assert!(log.contains("steps were already done and skipped"), "{log}");
+    assert!(!log.contains("ADD CONSTRAINT body_pkey"), "finished steps must not run again:\n{log}");
+    assert!(constraints(&mut c).values().all(|v| *v), "every constraint validated");
+    let indexes: i64 = c.query_one("SELECT count(*) FROM pg_indexes WHERE schemaname = 'spansh' AND indexname LIKE '%_idx'", &[]).unwrap().get(0);
+    assert_eq!(indexes, 7);
+}
