@@ -155,6 +155,10 @@ Repository layout:
 | `docs/research-notes.md` | dump format, data quirks, design decisions |
 | `docs/survey/` | survey reports of each Spansh dump, including the full galaxy |
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Data and acknowledgements
 
 The data comes from [Spansh](https://spansh.co.uk/), built from player-submitted EDDN journal
