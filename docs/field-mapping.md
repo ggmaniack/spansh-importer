@@ -13,7 +13,7 @@ the load). All tables live in schema `spansh`. Paths below are relative to one s
 | Floats | `DOUBLE PRECISION`; serde_json parses to the nearest f64, which round-trips the source text. Integers in float fields (e.g. `powerStateReinforcement`) are stored as doubles, exact below 2^53. |
 | Timestamps | `TIMESTAMPTZ`, microsecond precision. Accepted shapes: `YYYY-MM-DD[T ]HH:MM:SS[.f{1,6}](Z\|+00\|+00:00)`. Anything else -> `extra` + `import_issue`. |
 | Enum-like strings | `SMALLINT` -> `lookup(id, kind, name)`; exact, case-sensitive string. New values are added on first sight, never rejected. |
-| Catalogue entities | `commodity`, `module`, `ship` keyed by Frontier id. An id seen again with different attributes -> `import_issue` (`catalogue_conflict`) and the full item kept in the station's `extra`. |
+| Catalogue entities | `commodity`, `ship` keyed by Frontier id. An id seen again with different attributes -> `import_issue` (`catalogue_conflict`) and the full item kept in the station's `extra`. Modules legitimately keep old names/ratings per station, so each distinct attribute set is a `module_variant` row (importer-assigned id); no conflicts. |
 | Unknown fields | Any key not listed below is copied, with its value, into the nearest entity's `extra` JSONB (`system`, `body` or `station`), keyed by its path relative to that entity. Nothing is dropped. |
 | Type mismatches / overflow | A value that does not fit its column (string in a number field, integer > `INTEGER` max, ...) -> column `NULL`, original value in `extra`, `import_issue` row. |
 | Map keys | Known map keys get columns; unknown keys go to `extra` (e.g. a new `timestamps` key). |
@@ -55,10 +55,10 @@ the load). All tables live in schema `spansh`. Paths below are relative to one s
 | `isLandable`, `gravity`, `earthMasses`, `radius`, `surfacePressure` | snake_case | planets |
 | `volcanismType`, `atmosphereType`, `terraformingState`, `reserveLevel` | `volcanism`, `atmosphere`, `terraforming_state`, `reserve_level` | lookups |
 | `timestamps.{meanAnomaly,distanceToArrival}` | `ts_mean_anomaly`, `ts_distance_to_arrival` | other keys -> `extra` |
-| `parents[]` (`{kind: bodyId}`) | `body_parent(ordinal, kind, parent_body_id)` | ordinal 0 = immediate parent; kind lookup `parent_kind` |
-| `atmosphereComposition{}` | `body_composition` | component lookup kind `atmosphere_gas` |
-| `solidComposition{}` | `body_composition` | kind `solid` |
-| `materials{}` | `body_composition` | kind `material` |
+| `parents[]` (`{kind: bodyId}`) | `parent_kinds SMALLINT[]`, `parent_body_ids SMALLINT[]` | parallel arrays, element 1 = immediate parent; kind lookup `parent_kind` |
+| `atmosphereComposition{}` | `atm_<gas>` columns (13) | percent; a component without a column goes to `extra` |
+| `solidComposition{}` | `solid_ice`, `solid_rock`, `solid_metal` | percent |
+| `materials{}` | `mat_<element>` columns (25) | percent |
 | `signals.signals{}` | `body_signal(signal, count)` | lookup `signal` |
 | `signals.updateTime` | `signals_updated_at` | |
 | `signals.genuses[]` | `genuses SMALLINT[]` | lookup `genus` |
@@ -84,18 +84,19 @@ the load). All tables live in schema `spansh`. Paths below are relative to one s
 | `market.commodities[]` | `market_commodity(commodity_id, buy_price, sell_price, demand, supply)` | `name`, `symbol`, `category` -> `commodity` |
 | `market.prohibitedCommodities[]` | `prohibited_commodities TEXT[]` | |
 | `shipyard.updateTime`, `shipyard.ships[]` | `shipyard_updated_at`, `ship_ids INTEGER[]` | `name`, `symbol` -> `ship` |
-| `outfitting.updateTime`, `outfitting.modules[]` | `outfitting_updated_at`, `module_ids INTEGER[]` | `name`, `symbol`, `class`, `rating`, `category`, `ship` -> `module` |
+| `outfitting.updateTime`, `outfitting.modules[]` | `outfitting_updated_at`, `module_variant_ids INTEGER[]` | `moduleId`, `name`, `symbol`, `class`, `rating`, `category`, `ship` -> `module_variant` |
 
 ## Design notes
 
 - Why arrays for services, ships, modules, genuses and powers: they are pure id lists with no per-item
   values. As rows they would be the biggest tables (71.5M outfitting rows in galaxy_populated alone,
-  ~40 bytes each); as `INTEGER[]` they cost ~4 bytes per item and stay queryable (`module_ids @> '{128049250}'`,
+  ~40 bytes each); as `INTEGER[]` they cost ~4 bytes per item and stay queryable (`module_variant_ids @> '{42}'`,
   with GIN indexes).
-- Why rows for markets, compositions, parents, signals: each item carries its own values.
-- Storage risk to measure on the first imports: `body_parent` and `body_composition` grow with the body
-  count (estimated 0.2-0.7 billion bodies galaxy-wide, ~1.8 parents and ~8 composition entries each).
-  If they dominate, switch them to fixed columns or arrays on `body`.
+- Why rows for markets and signals: each item carries its own values.
+- Why columns for compositions and arrays for parents: they were the two biggest row tables per body
+  (610M bodies galaxy-wide, ~1.9 parents and ~7.6 composition entries each; 24-byte tuple header per
+  row). The component sets are closed game data - 41 across the full galaxy survey - so fixed nullable
+  columns cost ~8 bytes per present value and nothing for absent ones (NULL bitmap).
 - One `lookup` table instead of ~30 enum tables or PostgreSQL enums: the value sets drift with game
   updates (new spectral classes, `DamagedHuman`, `PlanetAnomaly`...), and a new value must never fail the import.
 - Faction names stay `TEXT` per system: ~650k rows, small; a faction dictionary can come later if needed.

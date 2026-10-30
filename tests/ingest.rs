@@ -71,8 +71,6 @@ const DATA_TABLES: &[&str] = &[
     "power_conflict",
     "thargoid_war",
     "body",
-    "body_parent",
-    "body_composition",
     "body_signal",
     "ring",
     "ring_signal",
@@ -114,8 +112,6 @@ fn expected_counts(systems: &[Value]) -> HashMap<&'static str, i64> {
         let mut stations = arr(s, "stations");
         for b in arr(s, "bodies") {
             add("body", 1);
-            add("body_parent", arr(&b, "parents").len() as i64);
-            add("body_composition", obj_len(&b, "atmosphereComposition") + obj_len(&b, "solidComposition") + obj_len(&b, "materials"));
             add("body_signal", b.get("signals").map_or(0, |sg| obj_len(sg, "signals")));
             for r in arr(&b, "rings").into_iter().chain(arr(&b, "belts")) {
                 add("ring", 1);
@@ -149,19 +145,25 @@ fn imports_fixture_with_expected_rows_and_keys() {
         ("system", "security", "security"),
         ("body", "sub_type", "body_sub_type"),
         ("body", "spectral_class", "spectral_class"),
-        ("body_composition", "component", NULL_KIND),
         ("station", "type", "station_type"),
-        ("body_parent", "kind", "parent_kind"),
     ] {
-        let kind_check = if kind == NULL_KIND { "l.kind IN ('atmosphere_gas','solid','material')".to_owned() } else { format!("l.kind = '{kind}'") };
         let bad: i64 = c
-            .query_one(&format!("SELECT count(*) FROM {table} t LEFT JOIN lookup l ON l.id = t.{col} AND {kind_check} WHERE t.{col} IS NOT NULL AND l.id IS NULL"), &[])
+            .query_one(&format!("SELECT count(*) FROM {table} t LEFT JOIN lookup l ON l.id = t.{col} AND l.kind = '{kind}' WHERE t.{col} IS NOT NULL AND l.id IS NULL"), &[])
             .unwrap()
             .get(0);
         assert_eq!(bad, 0, "{table}.{col} has ids outside lookup kind {kind}");
     }
+    let bad: i64 = c
+        .query_one("SELECT count(*) FROM body t, unnest(t.parent_kinds) k LEFT JOIN lookup l ON l.id = k AND l.kind = 'parent_kind' WHERE l.id IS NULL", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(bad, 0, "body.parent_kinds has ids outside lookup kind parent_kind");
+    let bad: i64 = c
+        .query_one("SELECT count(*) FROM station t, unnest(t.module_variant_ids) v LEFT JOIN module_variant m ON m.id = v WHERE m.id IS NULL", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(bad, 0, "station.module_variant_ids references missing variants");
 }
-const NULL_KIND: &str = "<composition>";
 
 /// Normalises timestamps from either side to `YYYY-MM-DDTHH:MM:SS[.frac]+00:00` without trailing zeros.
 fn norm_ts(s: &str) -> String {
@@ -277,14 +279,48 @@ fn round_trips_scalar_fields() {
         let mut stations_src = arr(&s, "stations");
         for b in arr(&s, "bodies") {
             let bid = b["id64"].as_u64().unwrap() as i64;
-            check(&format!("body {bid}"), &b, &bodies[&bid], body_map);
-            assert_eq!(bodies[&bid]["system_id64"].as_i64(), Some(id));
+            let row = &bodies[&bid];
+            check(&format!("body {bid}"), &b, row, body_map);
+            assert_eq!(row["system_id64"].as_i64(), Some(id));
+            for (key, prefix) in [("solidComposition", "solid_"), ("atmosphereComposition", "atm_"), ("materials", "mat_")] {
+                for (comp, pct) in b.get(key).and_then(Value::as_object).into_iter().flatten() {
+                    let col = format!("{prefix}{}", comp.to_lowercase().replace(' ', "_"));
+                    assert_eq!(row[&col].as_f64(), pct.as_f64(), "body {bid}: {key}.{comp}");
+                }
+            }
+            let parents = arr(&b, "parents");
+            let (kinds, pids): (Vec<Value>, Vec<Value>) = parents
+                .iter()
+                .map(|p| {
+                    let (k, v) = p.as_object().unwrap().iter().next().unwrap();
+                    (Value::String(k.clone()), v.clone())
+                })
+                .unzip();
+            let db_kinds: Vec<Value> = row["parent_kinds"].as_array().into_iter().flatten().map(|i| Value::String(names[&(i.as_i64().unwrap() as i16)].clone())).collect();
+            assert_eq!((db_kinds, row["parent_body_ids"].as_array().cloned().unwrap_or_default()), (kinds, pids), "body {bid}: parents");
             stations_src.extend(arr(&b, "stations"));
             n.1 += 1;
         }
         for st in stations_src {
             let sid = st["id"].as_u64().unwrap() as i64;
             check(&format!("station {sid}"), &st, &stations[&sid], station_map);
+            let modules: Vec<(i64, String, Option<String>)> = st
+                .get("outfitting")
+                .map(|o| arr(o, "modules"))
+                .unwrap_or_default()
+                .iter()
+                .map(|m| (m["moduleId"].as_i64().unwrap(), m["name"].as_str().unwrap().to_owned(), m.get("ship").and_then(Value::as_str).map(str::to_owned)))
+                .collect();
+            let db_modules: Vec<(i64, String, Option<String>)> = c
+                .query(
+                    "SELECT m.module_id::bigint, m.name, m.ship FROM station s, unnest(s.module_variant_ids) WITH ORDINALITY v(id, n) JOIN module_variant m ON m.id = v.id WHERE s.id = $1 ORDER BY v.n",
+                    &[&sid],
+                )
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect();
+            assert_eq!(db_modules, modules, "station {sid}: modules");
             n.2 += 1;
         }
         n.0 += 1;

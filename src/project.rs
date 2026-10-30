@@ -17,13 +17,15 @@ pub const TABLES: &[(&str, &str)] = &[
     ("faction_state", "system_id64,faction_name,bucket,state,trend"),
     ("power_conflict", "system_id64,power,progress"),
     ("thargoid_war", "system_id64,current_state,success_state,failure_state,progress,days_remaining,ports_remaining,success_reached"),
-    ("body", "id64,system_id64,body_id,name,type,sub_type,updated_at,distance_to_arrival,orbital_period,semi_major_axis,orbital_eccentricity,orbital_inclination,arg_of_periapsis,mean_anomaly,ascending_node,rotational_period,tidally_locked,axial_tilt,surface_temperature,main_star,age,spectral_class,luminosity,absolute_magnitude,solar_masses,solar_radius,is_landable,gravity,earth_masses,radius,surface_pressure,volcanism,atmosphere,terraforming_state,reserve_level,ts_mean_anomaly,ts_distance_to_arrival,signals_updated_at,genuses,extra"),
-    ("body_parent", "body_id64,ordinal,kind,parent_body_id"),
-    ("body_composition", "body_id64,component,percent"),
+    ("body", "id64,system_id64,body_id,name,type,sub_type,updated_at,distance_to_arrival,orbital_period,semi_major_axis,orbital_eccentricity,orbital_inclination,arg_of_periapsis,mean_anomaly,ascending_node,rotational_period,tidally_locked,axial_tilt,surface_temperature,main_star,age,spectral_class,luminosity,absolute_magnitude,solar_masses,solar_radius,is_landable,gravity,earth_masses,radius,surface_pressure,volcanism,atmosphere,terraforming_state,reserve_level,ts_mean_anomaly,ts_distance_to_arrival,signals_updated_at,genuses,parent_kinds,parent_body_ids,\
+solid_ice,solid_rock,solid_metal,\
+atm_ammonia,atm_argon,atm_carbon_dioxide,atm_helium,atm_hydrogen,atm_iron,atm_methane,atm_neon,atm_nitrogen,atm_oxygen,atm_silicates,atm_sulphur_dioxide,atm_water,\
+mat_antimony,mat_arsenic,mat_cadmium,mat_carbon,mat_chromium,mat_germanium,mat_iron,mat_manganese,mat_mercury,mat_molybdenum,mat_nickel,mat_niobium,mat_phosphorus,\
+mat_polonium,mat_ruthenium,mat_selenium,mat_sulphur,mat_technetium,mat_tellurium,mat_tin,mat_tungsten,mat_vanadium,mat_yttrium,mat_zinc,mat_zirconium,extra"),
     ("body_signal", "body_id64,signal,count"),
     ("ring", "body_id64,is_belt,ordinal,name,type,mass,inner_radius,outer_radius,id64,signals_updated_at"),
     ("ring_signal", "body_id64,is_belt,ordinal,signal,count"),
-    ("station", "id,system_id64,body_id64,name,updated_at,real_name,carrier_name,controlling_faction,controlling_faction_state,distance_to_arrival,primary_economy,secondary_economy,allegiance,government,type,state,carrier_docking_access,latitude,longitude,pads_large,pads_medium,pads_small,services,market_updated_at,prohibited_commodities,shipyard_updated_at,ship_ids,outfitting_updated_at,module_ids,extra"),
+    ("station", "id,system_id64,body_id64,name,updated_at,real_name,carrier_name,controlling_faction,controlling_faction_state,distance_to_arrival,primary_economy,secondary_economy,allegiance,government,type,state,carrier_docking_access,latitude,longitude,pads_large,pads_medium,pads_small,services,market_updated_at,prohibited_commodities,shipyard_updated_at,ship_ids,outfitting_updated_at,module_variant_ids,extra"),
     ("station_economy", "station_id,economy,share"),
     ("market_commodity", "station_id,commodity_id,buy_price,sell_price,demand,supply"),
     ("import_issue", "run_id,ordinal,system_id64,path,kind,detail"),
@@ -37,8 +39,6 @@ pub enum T {
     PowerConflict,
     ThargoidWar,
     Body,
-    BodyParent,
-    BodyComposition,
     BodySignal,
     Ring,
     RingSignal,
@@ -131,7 +131,26 @@ pub fn parse_ts(s: &str) -> Option<i64> {
     Some((days * 86_400 + h * 3600 + mi * 60 + sec - offset_s) * 1_000_000 + micros)
 }
 
-type ModuleAttrs = (i16, i16, String, String, String, Option<String>);
+/// Body composition objects and their components, in the body table's column order. The column
+/// name is the prefix plus the lowercased component with spaces as underscores.
+const COMPOSITIONS: [(&str, &[&str]); 3] = [
+    ("solidComposition", &["Ice", "Rock", "Metal"]),
+    (
+        "atmosphereComposition",
+        &["Ammonia", "Argon", "Carbon dioxide", "Helium", "Hydrogen", "Iron", "Methane", "Neon", "Nitrogen", "Oxygen", "Silicates", "Sulphur dioxide", "Water"],
+    ),
+    (
+        "materials",
+        &[
+            "Antimony", "Arsenic", "Cadmium", "Carbon", "Chromium", "Germanium", "Iron", "Manganese", "Mercury", "Molybdenum", "Nickel", "Niobium", "Phosphorus",
+            "Polonium", "Ruthenium", "Selenium", "Sulphur", "Technetium", "Tellurium", "Tin", "Tungsten", "Vanadium", "Yttrium", "Zinc", "Zirconium",
+        ],
+    ),
+];
+const COMPOSITION_COLUMNS: usize = 41;
+
+/// (moduleId, class, category, rating, symbol, name, ship)
+type ModuleVariant = (i32, i16, i16, String, String, String, Option<String>);
 
 /// Enum-like strings and Frontier catalogue entities, mirrored in memory and inserted (committed)
 /// on first sight through a dedicated connection, so batches only ever reference committed rows.
@@ -140,7 +159,7 @@ pub struct Dict {
     lookups: HashMap<String, HashMap<String, i16>>,
     next_id: i16,
     commodities: HashMap<i32, (String, String, i16)>,
-    modules: HashMap<i32, ModuleAttrs>,
+    module_variants: HashMap<ModuleVariant, i32>,
     ships: HashMap<i32, (String, String)>,
 }
 
@@ -158,17 +177,17 @@ impl Dict {
             .iter()
             .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3))))
             .collect();
-        let modules = conn
-            .query("SELECT id, class, category, rating, symbol, name, ship FROM spansh.module", &[])?
+        let module_variants = conn
+            .query("SELECT id, module_id, class, category, rating, symbol, name, ship FROM spansh.module_variant", &[])?
             .iter()
-            .map(|r| (r.get(0), (r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6))))
+            .map(|r| ((r.get(1), r.get(2), r.get(3), r.get(4), r.get(5), r.get(6), r.get(7)), r.get(0)))
             .collect();
         let ships = conn
             .query("SELECT id, symbol, name FROM spansh.ship", &[])?
             .iter()
             .map(|r| (r.get(0), (r.get(1), r.get(2))))
             .collect();
-        Ok(Dict { conn, lookups, next_id, commodities, modules, ships })
+        Ok(Dict { conn, lookups, next_id, commodities, module_variants, ships })
     }
 
     pub fn lookup(&mut self, kind: &str, name: &str) -> Result<i16> {
@@ -196,16 +215,17 @@ impl Dict {
         Ok(true)
     }
 
-    fn module(&mut self, id: i32, v: ModuleAttrs) -> Result<bool> {
-        if let Some(known) = self.modules.get(&id) {
-            return Ok(*known == v);
+    fn module_variant(&mut self, v: ModuleVariant) -> Result<i32> {
+        if let Some(id) = self.module_variants.get(&v) {
+            return Ok(*id);
         }
+        let id = self.module_variants.len() as i32 + 1;
         self.conn.execute(
-            "INSERT INTO spansh.module (id, class, category, rating, symbol, name, ship) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[&id, &v.0, &v.1, &v.2, &v.3, &v.4, &v.5],
+            "INSERT INTO spansh.module_variant (id, module_id, class, category, rating, symbol, name, ship) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[&id, &v.0, &v.1, &v.2, &v.3, &v.4, &v.5, &v.6],
         )?;
-        self.modules.insert(id, v);
-        Ok(true)
+        self.module_variants.insert(v, id);
+        Ok(id)
     }
 
     fn ship(&mut self, id: i32, v: (String, String)) -> Result<bool> {
@@ -701,19 +721,30 @@ impl Projector {
             }
         }
         let d = &mut self.dict;
-        for (ordinal, p) in f.arr("parents").unwrap_or_default().into_iter().enumerate() {
-            match p {
-                Value::Object(m) if m.len() == 1 && m.values().all(is_i16) => {
-                    let (kind, pid) = m.into_iter().next().expect("one entry");
-                    let kind = d.lookup("parent_kind", &kind)?;
-                    b.t(T::BodyParent).row(4).i64(Some(id)).i16(Some(ordinal as i16)).i16(Some(kind)).i16(pid.as_i64().map(|x| x as i16));
+        let mut parents: Option<(Vec<i16>, Vec<i16>)> = None;
+        if let Some(items) = f.arr("parents") {
+            let (kinds, ids) = parents.insert((Vec::with_capacity(items.len()), Vec::with_capacity(items.len())));
+            for (ordinal, p) in items.into_iter().enumerate() {
+                match p {
+                    Value::Object(m) if m.len() == 1 && m.values().all(is_i16) => {
+                        let (kind, pid) = m.into_iter().next().expect("one entry");
+                        kinds.push(d.lookup("parent_kind", &kind)?);
+                        ids.push(pid.as_i64().expect("checked") as i16);
+                    }
+                    other => f.misfit(format!("parents[{ordinal}]"), other),
                 }
-                other => f.misfit(format!("parents[{ordinal}]"), other),
             }
         }
-        for (key, kind) in [("atmosphereComposition", "atmosphere_gas"), ("solidComposition", "solid"), ("materials", "material")] {
-            for (component, pct) in f.lookup_map(key, kind, d, Value::as_f64)? {
-                b.t(T::BodyComposition).row(3).i64(Some(id)).i16(Some(component)).f64(Some(pct));
+        let mut composition = [None; COMPOSITION_COLUMNS];
+        let mut slots = composition.iter_mut();
+        for (key, components) in COMPOSITIONS {
+            let mut c = f.obj(key);
+            for component in components {
+                *slots.next().expect("COMPOSITION_COLUMNS") = c.as_mut().and_then(|c| c.f64(component));
+            }
+            // Components without a column land in extra as unknown fields.
+            if let Some(c) = c {
+                c.finish(&mut extra, &mut self.issues);
             }
         }
         let (mut signals_at, mut genuses) = (None, None);
@@ -733,7 +764,7 @@ impl Projector {
         }
         let body_id: Option<i16> = f.int("bodyId");
         let name = f.string("name");
-        let row = b.t(T::Body).row(40);
+        let row = b.t(T::Body).row(42 + COMPOSITION_COLUMNS as i16);
         row.i64(Some(id))
             .i64(Some(sys))
             .i16(body_id)
@@ -776,7 +807,12 @@ impl Projector {
             .ts(ts_mean_anomaly)
             .ts(ts_distance)
             .ts(signals_at)
-            .i16_array(genuses.as_deref());
+            .i16_array(genuses.as_deref())
+            .i16_array(parents.as_ref().map(|p| &p.0[..]))
+            .i16_array(parents.as_ref().map(|p| &p.1[..]));
+        for pct in composition {
+            row.f64(pct);
+        }
         f.finish(&mut extra, &mut self.issues);
         b.t(T::Body).jsonb((!extra.is_empty()).then_some(&extra));
         Ok(())
@@ -906,7 +942,7 @@ impl Projector {
             sy.finish(&mut extra, &mut self.issues);
         }
 
-        let (mut outfitting_at, mut module_ids) = (None, None);
+        let (mut outfitting_at, mut variant_ids) = (None, None);
         if let Some(mut of) = f.obj("outfitting") {
             outfitting_at = of.ts("updateTime");
             let checks: &[(&str, fn(&Value) -> bool)] =
@@ -914,27 +950,20 @@ impl Projector {
             if let Some(items) = of.items("modules", checks) {
                 let mut ids = Vec::with_capacity(items.len());
                 for mut m in items {
-                    let mid: i32 = m.int("moduleId").expect("checked");
-                    let class: i16 = m.int("class").expect("checked");
                     let cat_name = m.string("category").expect("checked");
-                    let cat = d.lookup("module_category", &cat_name)?;
-                    let ship = m.string("ship");
-                    let attrs: ModuleAttrs = (class, cat, m.string("rating").expect("checked"), m.string("symbol").expect("checked"), m.string("name").expect("checked"), ship);
-                    if !d.module(mid, attrs.clone())? {
-                        self.issues.add(format!("station.{}", m.prefix), "catalogue_conflict", format!("module {mid}: {} / {}", attrs.3, attrs.4));
-                        m.keep("class", Value::from(attrs.0));
-                        m.keep("category", Value::String(cat_name));
-                        m.keep("rating", Value::String(attrs.2));
-                        m.keep("symbol", Value::String(attrs.3));
-                        m.keep("name", Value::String(attrs.4));
-                        if let Some(s) = attrs.5 {
-                            m.keep("ship", Value::String(s));
-                        }
-                    }
-                    ids.push(mid);
+                    let v: ModuleVariant = (
+                        m.int("moduleId").expect("checked"),
+                        m.int("class").expect("checked"),
+                        d.lookup("module_category", &cat_name)?,
+                        m.string("rating").expect("checked"),
+                        m.string("symbol").expect("checked"),
+                        m.string("name").expect("checked"),
+                        m.string("ship"),
+                    );
+                    ids.push(d.module_variant(v)?);
                     m.finish(&mut extra, &mut self.issues);
                 }
-                module_ids = Some(ids);
+                variant_ids = Some(ids);
             }
             of.finish(&mut extra, &mut self.issues);
         }
@@ -969,7 +998,7 @@ impl Projector {
             .ts(shipyard_at)
             .i32_array(ship_ids.as_deref())
             .ts(outfitting_at)
-            .i32_array(module_ids.as_deref());
+            .i32_array(variant_ids.as_deref());
         f.finish(&mut extra, &mut self.issues);
         b.t(T::Station).jsonb((!extra.is_empty()).then_some(&extra));
         Ok(())
@@ -978,7 +1007,27 @@ impl Projector {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ts;
+    use super::{parse_ts, COMPOSITIONS, COMPOSITION_COLUMNS, TABLES};
+
+    #[test]
+    fn composition_columns_match_the_body_copy_list() {
+        let expected: Vec<String> = COMPOSITIONS
+            .iter()
+            .flat_map(|(key, comps)| {
+                let prefix = match *key {
+                    "solidComposition" => "solid_",
+                    "atmosphereComposition" => "atm_",
+                    _ => "mat_",
+                };
+                comps.iter().map(move |c| format!("{prefix}{}", c.to_lowercase().replace(' ', "_")))
+            })
+            .collect();
+        assert_eq!(expected.len(), COMPOSITION_COLUMNS);
+        let body: Vec<&str> = TABLES.iter().find(|t| t.0 == "body").unwrap().1.split(',').collect();
+        let at = body.iter().position(|c| *c == "solid_ice").unwrap();
+        assert_eq!(body[at..at + COMPOSITION_COLUMNS], expected[..]);
+        assert_eq!(body.len(), 42 + COMPOSITION_COLUMNS);
+    }
 
     #[test]
     fn parses_all_observed_timestamp_shapes() {
