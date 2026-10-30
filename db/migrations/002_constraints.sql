@@ -61,4 +61,7 @@ CREATE INDEX IF NOT EXISTS station_module_variant_ids_idx ON station USING gin (
 CREATE INDEX IF NOT EXISTS module_variant_module_id_idx   ON module_variant (module_id);
 CREATE INDEX IF NOT EXISTS station_ship_ids_idx           ON station USING gin (ship_ids);
 
+-- ANALYZE's sample sees only ~75k distinct systems among 610M bodies (rows are clustered by system),
+-- which made GROUP BY system_id64 pick a plan that ran for hours. About 3 bodies per system.
+ALTER TABLE body ALTER COLUMN system_id64 SET (n_distinct = -0.33);
 ANALYZE;

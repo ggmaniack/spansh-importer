@@ -179,6 +179,19 @@ NVMe SSD and PostgreSQL 18:
 | Database size | 223 GB before `finalize` |
 | Time split | read + gunzip 16%, JSON parse 32%, projection 28%, COPY + commit 24% |
 
+`finalize` on the same database:
+
+| Step | Time | Size |
+|---|---:|---:|
+| keys, foreign key checks, indexes, `ANALYZE` | 34 min | 38 GB of indexes |
+| `system_coords_idx` (GiST on `cube`, no sorted build) | 1 h 42 min | 19 GB |
+| `system_flags` (76M systems with known stars) | 6 min 42 s | 4.9 GB |
+| Database total | | 284 GB |
+
+`body.system_id64` gets a fixed `n_distinct` before `ANALYZE`. Bodies are stored clustered by
+system, so the sampled estimate was ~75k systems instead of ~200M. With that estimate,
+`system_flags` picked a parallel hash aggregate that hadn't finished after 1.5 h.
+
 Parsing and projection are about 60% of the time and run on one thread. They are the target for
 parallel workers.
 
